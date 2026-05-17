@@ -1,5 +1,6 @@
 import io
 import json
+import traceback
 from typing import Optional
 
 import cv2
@@ -27,6 +28,13 @@ def intersection_area(boxA, boxB):
     x1 = min(boxA[2], boxB[2])
     y1 = min(boxA[3], boxB[3])
     return max(0, x1 - x0) * max(0, y1 - y0)
+
+
+def _match_label_to_target(label: str, target_text: str) -> bool:
+    """Return True if a GDino detection label corresponds to a target text prompt."""
+    lc = label.strip().rstrip(".").lower()
+    tc = target_text.strip().rstrip(".").lower()
+    return lc == tc or lc in tc or tc in lc
 
 
 def filter_boxes(boxes, threshold=0.9, max_inside=3):
@@ -336,6 +344,12 @@ def _reply(socket, meta: dict, mask_hw: Optional[np.ndarray]):
     socket.send_multipart([json.dumps(meta_out).encode("utf-8"), mask_bytes])
 
 
+def _reply_error(socket, reason: str, **extra):
+    meta = {"ok": False, "reason": reason}
+    meta.update(extra)
+    socket.send_multipart([json.dumps(meta).encode("utf-8")])
+
+
 def _handle_legacy_request(
     socket,
     message_parts,
@@ -436,6 +450,172 @@ def _handle_legacy_request(
     )
 
 
+def batch_first_step_fused(
+    processor,
+    grounding_model,
+    video_predictor,
+    device,
+    batch_requests,
+    image_pil,
+    image_inp,
+    video_height,
+    video_width,
+):
+    """
+    Fused GroundingDINO + SAM2 inference for all N segment targets in a single pass.
+
+    Replaces N × (GDino + SAM2-init + SAM2-propagate) with:
+      1 × GDino   (combined text query, all targets at once)
+      1 × SAM2 image encoding  (shared inference_state)
+      1 × SAM2 propagate       (all objects batched in one state)
+
+    batch_requests: list of (target_text, req_params, allow_fallback, fallback_steps).
+    Returns:        list of (mask_hw_or_None, inference_state_or_None, meta) in the same order.
+    """
+    target_texts = [r[0] for r in batch_requests]
+
+    # Build combined GDino text query: "red box. white cube. blue cylinder. ..."
+    combined_text = " ".join(
+        t.strip() if t.strip().endswith(".") else t.strip() + "."
+        for t in target_texts
+    )
+
+    # One GDino forward pass at the globally lowest threshold.
+    # Per-target threshold filtering happens in Python — no additional GDino calls.
+    _GLOBAL_MIN_THR = 0.05
+    inputs = processor(
+        images=image_pil, text=combined_text, return_tensors="pt"
+    ).to(device)
+    with torch.no_grad():
+        outputs = grounding_model(**inputs)
+    results = processor.post_process_grounded_object_detection(
+        outputs,
+        inputs.input_ids,
+        threshold=_GLOBAL_MIN_THR,
+        text_threshold=_GLOBAL_MIN_THR,
+        target_sizes=[image_pil.size[::-1]],
+    )
+    all_scores = results[0]["scores"].cpu().numpy()
+    all_boxes = results[0]["boxes"].cpu().numpy()
+    all_labels = [str(lbl) for lbl in results[0]["labels"]]
+    print(
+        f"[fused] GDino: {len(all_labels)} detections "
+        f"for {len(target_texts)} targets"
+    )
+
+    # One SAM2 image encoding shared across all objects
+    inference_state = video_predictor.non_video_path_init_state(
+        image_inp, video_height, video_width
+    )
+
+    output_results = [None] * len(batch_requests)
+    obj_id_map = {}  # obj_id -> (req_idx, best_score, label, p_used, used_fallback)
+    next_obj_id = 1
+
+    for req_idx, (target_text, req_params, allow_fallback, fallback_steps) in enumerate(
+        batch_requests
+    ):
+        threshold_seq = [req_params]
+        if allow_fallback and fallback_steps:
+            threshold_seq.extend(fallback_steps)
+
+        matching_dets = [
+            (float(all_scores[i]), all_boxes[i], all_labels[i])
+            for i in range(len(all_labels))
+            if _match_label_to_target(all_labels[i], target_text)
+        ]
+
+        if not matching_dets:
+            output_results[req_idx] = (None, None, {
+                "ok": False,
+                "reason": "no_boxes",
+                "best_score": None,
+                "params_used": req_params,
+                "used_fallback": False,
+            })
+            continue
+
+        # Walk fallback threshold levels in pure Python — no re-inference
+        placed = False
+        for level_idx, p in enumerate(threshold_seq):
+            box_thr = float(p.get("box_threshold", 0.35))
+            min_score = float(p.get("min_best_score", 0.35))
+            candidates = [(s, b, l) for s, b, l in matching_dets if s >= box_thr]
+            if not candidates:
+                continue
+            best_score, best_box, best_label = max(candidates, key=lambda x: x[0])
+            if best_score < min_score:
+                continue
+            obj_id = next_obj_id
+            next_obj_id += 1
+            video_predictor.add_new_points_or_box(
+                inference_state=inference_state,
+                frame_idx=0,
+                obj_id=obj_id,
+                box=best_box,
+            )
+            obj_id_map[obj_id] = (req_idx, best_score, best_label, p, level_idx > 0)
+            placed = True
+            break
+
+        if not placed:
+            best_overall = max((s for s, _, _ in matching_dets), default=None)
+            output_results[req_idx] = (None, None, {
+                "ok": False,
+                "reason": "low_score",
+                "best_score": best_overall,
+                "params_used": threshold_seq[-1],
+                "used_fallback": allow_fallback and len(threshold_seq) > 1,
+            })
+
+    if not obj_id_map:
+        for i in range(len(output_results)):
+            if output_results[i] is None:
+                output_results[i] = (None, None, {"ok": False, "reason": "unknown"})
+        return output_results
+
+    # One SAM2 propagation pass — all matched objects processed together
+    video_segments = {}
+    for out_frame_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(
+        inference_state
+    ):
+        video_segments[out_frame_idx] = {
+            oid: (out_mask_logits[i] > 0.0).cpu().numpy()
+            for i, oid in enumerate(out_obj_ids)
+        }
+
+    segments = next(iter(video_segments.values())) if video_segments else {}
+
+    for obj_id, (req_idx, best_score, label, p_used, used_fallback) in obj_id_map.items():
+        mask_data = segments.get(obj_id)
+        if mask_data is None:
+            output_results[req_idx] = (None, None, {
+                "ok": False,
+                "reason": "propagate_no_mask",
+                "best_score": best_score,
+                "params_used": p_used,
+            })
+            continue
+        # mask_data shape: (1, H, W) from (logits > 0).cpu().numpy()
+        mask_hw = (
+            np.any(mask_data, axis=0) if mask_data.ndim == 3 else mask_data
+        ).astype(np.bool_)
+        output_results[req_idx] = (mask_hw, inference_state, {
+            "ok": True,
+            "reason": "ok",
+            "best_score": best_score,
+            "label": label,
+            "params_used": p_used,
+            "used_fallback": used_fallback,
+        })
+
+    for i in range(len(output_results)):
+        if output_results[i] is None:
+            output_results[i] = (None, None, {"ok": False, "reason": "unknown"})
+
+    return output_results
+
+
 def main():
     context = zmq.Context()
     socket = context.socket(zmq.REP)
@@ -489,6 +669,20 @@ def main():
 
         cmd = message_parts[0]
 
+        if cmd == b"ping":
+            socket.send_multipart(
+                [
+                    json.dumps(
+                        {
+                            "ok": True,
+                            "server": "grounded_sam_2",
+                            "protocols": ["segment", "batch_segment", "set_config"],
+                        }
+                    ).encode("utf-8")
+                ]
+            )
+            continue
+
         if cmd == b"set_config" and len(message_parts) >= 2:
             try:
                 upd = json.loads(message_parts[1].decode("utf-8"))
@@ -501,13 +695,7 @@ def main():
                     ]
                 )
             except Exception as e:
-                socket.send_multipart(
-                    [
-                        json.dumps({"ok": False, "reason": str(e)}).encode(
-                            "utf-8"
-                        )
-                    ]
-                )
+                _reply_error(socket, str(e))
             continue
 
         if cmd == b"segment" and len(message_parts) >= 3:
@@ -517,102 +705,107 @@ def main():
                 _reply(socket, {"ok": False, "reason": f"bad_json:{e}"}, None)
                 continue
 
-            image_data = message_parts[2]
-            image_pil = Image.open(io.BytesIO(image_data))
-            image_prepared, video_height, video_width = load_single_image(
-                image_pil, 1024, compute_device=device
-            )
-
-            mode = spec.get("mode", "segment")
-            target_text = spec.get("target_text") or target_text_holder[0]
-            if not target_text:
-                _reply(socket, {"ok": False, "reason": "no_target_text"}, None)
-                continue
-            target_text_holder[0] = target_text
-
-            req_params = merge_gsam_params(
-                server_defaults, spec.get("params") or {}
-            )
-            allow_fallback = bool(spec.get("allow_fallback", True))
-            fallback_steps = spec.get("fallback_steps") or [
-                {
-                    "box_threshold": 0.12,
-                    "text_threshold": 0.18,
-                    "min_best_score": 0.22,
-                },
-                {
-                    "box_threshold": 0.08,
-                    "text_threshold": 0.12,
-                    "min_best_score": 0.12,
-                },
-            ]
-
-            max_f = int(req_params["max_frames_in_state"])
-
-            if mode == "track":
-                state = inference_states.get(target_text)
-                if state is None:
-                    _reply(
-                        socket,
-                        {
-                            "ok": False,
-                            "reason": "no_state_need_segment",
-                            "params_used": req_params,
-                        },
-                        None,
-                    )
-                    continue
-                mask_hw, inf = new_frame(
-                    video_predictor,
-                    state,
-                    image_prepared,
-                    max_f,
+            try:
+                image_data = message_parts[2]
+                image_pil = Image.open(io.BytesIO(image_data))
+                image_prepared, video_height, video_width = load_single_image(
+                    image_pil, 1024, compute_device=device
                 )
-                inference_states[target_text] = inf
-                if mask_hw is None:
-                    _reply(
-                        socket,
-                        {
-                            "ok": False,
-                            "reason": "tracking_failed",
-                            "params_used": req_params,
-                        },
-                        None,
-                    )
+
+                mode = spec.get("mode", "segment")
+                target_text = spec.get("target_text") or target_text_holder[0]
+                if not target_text:
+                    _reply(socket, {"ok": False, "reason": "no_target_text"}, None)
                     continue
-                meta = {
-                    "ok": True,
-                    "reason": "ok",
-                    "used_fallback": False,
-                    "params_used": req_params,
-                    "best_score": None,
-                    "label": None,
-                }
+                target_text_holder[0] = target_text
+
+                req_params = merge_gsam_params(
+                    server_defaults, spec.get("params") or {}
+                )
+                allow_fallback = bool(spec.get("allow_fallback", True))
+                fallback_steps = spec.get("fallback_steps") or [
+                    {
+                        "box_threshold": 0.12,
+                        "text_threshold": 0.18,
+                        "min_best_score": 0.22,
+                    },
+                    {
+                        "box_threshold": 0.08,
+                        "text_threshold": 0.12,
+                        "min_best_score": 0.12,
+                    },
+                ]
+
+                max_f = int(req_params["max_frames_in_state"])
+
+                if mode == "track":
+                    state = inference_states.get(target_text)
+                    if state is None:
+                        _reply(
+                            socket,
+                            {
+                                "ok": False,
+                                "reason": "no_state_need_segment",
+                                "params_used": req_params,
+                            },
+                            None,
+                        )
+                        continue
+                    mask_hw, inf = new_frame(
+                        video_predictor,
+                        state,
+                        image_prepared,
+                        max_f,
+                    )
+                    inference_states[target_text] = inf
+                    if mask_hw is None:
+                        _reply(
+                            socket,
+                            {
+                                "ok": False,
+                                "reason": "tracking_failed",
+                                "params_used": req_params,
+                            },
+                            None,
+                        )
+                        continue
+                    meta = {
+                        "ok": True,
+                        "reason": "ok",
+                        "used_fallback": False,
+                        "params_used": req_params,
+                        "best_score": None,
+                        "label": None,
+                    }
+                    _reply(socket, meta, mask_hw)
+                    continue
+
+                # mode == segment
+                mask_hw, inf, meta = run_segment_with_fallback(
+                    processor,
+                    grounding_model,
+                    video_predictor,
+                    image_predictor,
+                    device,
+                    target_text,
+                    image_pil,
+                    image_prepared,
+                    video_height,
+                    video_width,
+                    req_params,
+                    allow_fallback,
+                    fallback_steps,
+                )
+                if meta.get("ok"):
+                    inference_states[target_text] = inf
+                else:
+                    inference_states.pop(target_text, None)
                 _reply(socket, meta, mask_hw)
                 continue
-
-            # mode == segment
-            mask_hw, inf, meta = run_segment_with_fallback(
-                processor,
-                grounding_model,
-                video_predictor,
-                image_predictor,
-                device,
-                target_text,
-                image_pil,
-                image_prepared,
-                video_height,
-                video_width,
-                req_params,
-                allow_fallback,
-                fallback_steps,
-            )
-            if meta.get("ok"):
-                inference_states[target_text] = inf
-            else:
-                inference_states.pop(target_text, None)
-            _reply(socket, meta, mask_hw)
-            continue
+            except Exception as e:
+                traceback.print_exc()
+                _reply(socket, {"ok": False, "reason": f"server_error:{e}"}, None)
+                continue
 
         if cmd == b"batch_segment" and len(message_parts) >= 3:
             try:
@@ -638,23 +831,42 @@ def main():
                 )
                 continue
 
-            image_data = message_parts[2]
-            image_pil = Image.open(io.BytesIO(image_data))
-            image_prepared, video_height, video_width = load_single_image(
-                image_pil, 1024, compute_device=device
-            )
+            try:
+                image_data = message_parts[2]
+                image_pil = Image.open(io.BytesIO(image_data))
+                image_prepared, video_height, video_width = load_single_image(
+                    image_pil, 1024, compute_device=device
+                )
+            except Exception as e:
+                traceback.print_exc()
+                socket.send_multipart(
+                    [
+                        json.dumps(
+                            {
+                                "ok": False,
+                                "reason": f"server_error:{e}",
+                                "results": [],
+                            }
+                        ).encode("utf-8")
+                    ]
+                )
+                continue
 
-            results = []
-            mask_parts = []
-            for req in requests:
+            # Separate "segment" requests (fused inference) from "track" requests
+            results_proto = [None] * len(requests)  # (mask_hw|None, meta)
+            seg_indices = []
+            seg_batch_data = []
+            track_pending = []  # (orig_idx, target_text, req_params)
+
+            for req_idx, req in enumerate(requests):
                 mode = req.get("mode", "segment")
                 target_text = req.get("target_text")
                 if not target_text:
-                    results.append(
-                        _result_meta({"ok": False, "reason": "no_target_text"}, None)
+                    results_proto[req_idx] = (
+                        None,
+                        {"ok": False, "reason": "no_target_text"},
                     )
                     continue
-
                 req_params = merge_gsam_params(
                     server_defaults, req.get("params") or {}
                 )
@@ -671,70 +883,98 @@ def main():
                         "min_best_score": 0.12,
                     },
                 ]
-                max_f = int(req_params["max_frames_in_state"])
-
                 if mode == "track":
-                    state = inference_states.get(target_text)
-                    if state is None:
-                        results.append(
-                            _result_meta(
-                                {
-                                    "ok": False,
-                                    "reason": "no_state_need_segment",
-                                    "params_used": req_params,
-                                },
-                                None,
-                            )
-                        )
-                        continue
-                    mask_hw, inf = new_frame(
-                        video_predictor,
-                        state,
-                        image_prepared,
-                        max_f,
-                    )
-                    inference_states[target_text] = inf
-                    if mask_hw is None:
-                        results.append(
-                            _result_meta(
-                                {
-                                    "ok": False,
-                                    "reason": "tracking_failed",
-                                    "params_used": req_params,
-                                },
-                                None,
-                            )
-                        )
-                        continue
-                    meta = {
-                        "ok": True,
-                        "reason": "ok",
-                        "used_fallback": False,
-                        "params_used": req_params,
-                        "best_score": None,
-                        "label": None,
-                    }
+                    track_pending.append((req_idx, target_text, req_params))
                 else:
-                    mask_hw, inf, meta = run_segment_with_fallback(
+                    seg_indices.append(req_idx)
+                    seg_batch_data.append(
+                        (target_text, req_params, allow_fallback, fallback_steps)
+                    )
+
+            # Fused segment inference: 1 GDino pass + 1 SAM2 pass for all targets
+            if seg_batch_data:
+                try:
+                    fused_out = batch_first_step_fused(
                         processor,
                         grounding_model,
                         video_predictor,
-                        image_predictor,
                         device,
-                        target_text,
+                        seg_batch_data,
                         image_pil,
                         image_prepared,
                         video_height,
                         video_width,
-                        req_params,
-                        allow_fallback,
-                        fallback_steps,
                     )
-                    if meta.get("ok"):
-                        inference_states[target_text] = inf
-                    else:
-                        inference_states.pop(target_text, None)
+                    for orig_idx, (mask_hw, _inf, meta) in zip(
+                        seg_indices, fused_out
+                    ):
+                        results_proto[orig_idx] = (
+                            mask_hw if meta.get("ok") else None,
+                            meta,
+                        )
+                except Exception as e:
+                    traceback.print_exc()
+                    err_meta = {"ok": False, "reason": f"fused_error:{e}"}
+                    for orig_idx in seg_indices:
+                        results_proto[orig_idx] = (None, err_meta)
 
+            # Per-object track requests (existing logic, unchanged)
+            for orig_idx, target_text, req_params in track_pending:
+                try:
+                    max_f = int(req_params["max_frames_in_state"])
+                    state = inference_states.get(target_text)
+                    if state is None:
+                        results_proto[orig_idx] = (
+                            None,
+                            {
+                                "ok": False,
+                                "reason": "no_state_need_segment",
+                                "params_used": req_params,
+                            },
+                        )
+                        continue
+                    mask_hw, inf = new_frame(
+                        video_predictor, state, image_prepared, max_f
+                    )
+                    inference_states[target_text] = inf
+                    if mask_hw is None:
+                        results_proto[orig_idx] = (
+                            None,
+                            {
+                                "ok": False,
+                                "reason": "tracking_failed",
+                                "params_used": req_params,
+                            },
+                        )
+                    else:
+                        results_proto[orig_idx] = (
+                            mask_hw,
+                            {
+                                "ok": True,
+                                "reason": "ok",
+                                "used_fallback": False,
+                                "params_used": req_params,
+                                "best_score": None,
+                                "label": None,
+                            },
+                        )
+                except Exception as e:
+                    traceback.print_exc()
+                    results_proto[orig_idx] = (
+                        None,
+                        {"ok": False, "reason": f"server_error:{e}"},
+                    )
+
+            # Assemble final results and mask byte blobs in original order
+            results = []
+            mask_parts = []
+            for item in results_proto:
+                if item is None:
+                    results.append(
+                        _result_meta({"ok": False, "reason": "unprocessed"}, None)
+                    )
+                    continue
+                mask_hw, meta = item
                 if mask_hw is not None and meta.get("ok"):
                     mask_part_index = len(mask_parts)
                     mask_parts.append((mask_hw.astype(np.uint8) * 255).tobytes())
@@ -747,6 +987,20 @@ def main():
                     json.dumps({"ok": True, "results": results}).encode("utf-8"),
                     *mask_parts,
                 ]
+            )
+            continue
+
+        if cmd in {b"segment", b"batch_segment", b"set_config"}:
+            _reply_error(socket, f"bad_{cmd.decode('utf-8')}_request")
+            continue
+
+        if (
+            cmd.startswith(b"segment")
+            or cmd.startswith(b"batch")
+            or cmd.startswith(b"set_")
+        ):
+            _reply_error(
+                socket, f"unknown_command:{cmd.decode('utf-8', errors='replace')}"
             )
             continue
 
