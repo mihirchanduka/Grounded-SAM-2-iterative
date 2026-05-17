@@ -1,0 +1,38 @@
+[workspace]
+name = "grounded-sam-2-iterative"
+version = "0.1.0"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[system-requirements]
+cuda = "12.8"
+
+[activation]
+env = { PYTHONNOUSERSITE = "1", SAM2_BUILD_CUDA = "0" }
+
+[dependencies]
+python = "3.11.*"
+pip = "*"
+cuda-version = "==12.8"
+
+[pypi-dependencies]
+sam-2 = { path = ".", editable = true }
+torch = { version = "*", index = "https://download.pytorch.org/whl/cu128" }
+torchvision = { version = "*", index = "https://download.pytorch.org/whl/cu128" }
+numpy = "<2"
+opencv-python = "*"
+pillow = "*"
+pyzmq = "*"
+transformers = "*"
+timm = "*"
+hydra-core = "*"
+iopath = "*"
+tqdm = "*"
+supervision = ">=0.22.0"
+pycocotools = "*"
+matplotlib = "*"
+
+[tasks]
+server = "python server_gsam.py"
+check = "python -m py_compile server_gsam.py client_gsam.py"
+download-checkpoints = "bash checkpoints/download_ckpts.sh"
