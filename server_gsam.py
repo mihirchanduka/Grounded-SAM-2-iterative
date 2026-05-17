@@ -34,7 +34,15 @@ def _match_label_to_target(label: str, target_text: str) -> bool:
     """Return True if a GDino detection label corresponds to a target text prompt."""
     lc = label.strip().rstrip(".").lower()
     tc = target_text.strip().rstrip(".").lower()
-    return lc == tc or lc in tc or tc in lc
+    if lc == tc or lc in tc:
+        return True
+    # Guard tc-in-lc: only match if the label is not substantially longer than the
+    # target. Without this guard, a full combined-text label such as
+    # "red box white cube blue cylinder" matches every individual target phrase via
+    # substring containment, causing all objects to map to the same detection.
+    if tc in lc:
+        return len(lc.split()) <= len(tc.split()) + 1
+    return False
 
 
 def filter_boxes(boxes, threshold=0.9, max_inside=3):
@@ -511,6 +519,9 @@ def batch_first_step_fused(
     output_results = [None] * len(batch_requests)
     obj_id_map = {}  # obj_id -> (req_idx, best_score, label, p_used, used_fallback)
     next_obj_id = 1
+    # Track which GDino detection indices have been claimed so no two targets
+    # are assigned to the same physical detection box.
+    used_det_indices: set = set()
 
     for req_idx, (target_text, req_params, allow_fallback, fallback_steps) in enumerate(
         batch_requests
@@ -519,10 +530,12 @@ def batch_first_step_fused(
         if allow_fallback and fallback_steps:
             threshold_seq.extend(fallback_steps)
 
+        # Include the detection index so we can deduplicate across targets.
         matching_dets = [
-            (float(all_scores[i]), all_boxes[i], all_labels[i])
+            (float(all_scores[i]), all_boxes[i], all_labels[i], i)
             for i in range(len(all_labels))
             if _match_label_to_target(all_labels[i], target_text)
+            and i not in used_det_indices
         ]
 
         if not matching_dets:
@@ -540,12 +553,13 @@ def batch_first_step_fused(
         for level_idx, p in enumerate(threshold_seq):
             box_thr = float(p.get("box_threshold", 0.35))
             min_score = float(p.get("min_best_score", 0.35))
-            candidates = [(s, b, l) for s, b, l in matching_dets if s >= box_thr]
+            candidates = [(s, b, l, idx) for s, b, l, idx in matching_dets if s >= box_thr]
             if not candidates:
                 continue
-            best_score, best_box, best_label = max(candidates, key=lambda x: x[0])
+            best_score, best_box, best_label, best_det_idx = max(candidates, key=lambda x: x[0])
             if best_score < min_score:
                 continue
+            used_det_indices.add(best_det_idx)
             obj_id = next_obj_id
             next_obj_id += 1
             video_predictor.add_new_points_or_box(
@@ -559,7 +573,7 @@ def batch_first_step_fused(
             break
 
         if not placed:
-            best_overall = max((s for s, _, _ in matching_dets), default=None)
+            best_overall = max((s for s, _, _, _ in matching_dets), default=None)
             output_results[req_idx] = (None, None, {
                 "ok": False,
                 "reason": "low_score",
