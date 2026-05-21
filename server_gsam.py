@@ -76,6 +76,17 @@ def _merge_params(base: dict, override: Optional[dict]) -> dict:
 # Inference
 # ---------------------------------------------------------------------------
 
+def _match_label_to_target(label: str, target_text: str) -> bool:
+    """True if a GDino detection label corresponds to a target text prompt."""
+    lc = label.strip().rstrip(".").lower()
+    tc = target_text.strip().rstrip(".").lower()
+    if lc == tc or lc in tc:
+        return True
+    if tc in lc:
+        return len(lc.split()) <= len(tc.split()) + 1
+    return False
+
+
 def segment_one(
     processor,
     grounding_model,
@@ -214,6 +225,123 @@ def segment_with_fallback(
     return None, last_meta
 
 
+def batch_segment_fused(
+    processor,
+    grounding_model,
+    video_predictor,
+    device,
+    batch_requests,  # list of (target_text, req_params, allow_fallback, fallback_steps)
+    image_pil: Image.Image,
+    image_prepared,
+    video_height: int,
+    video_width: int,
+):
+    """
+    Single GDino forward pass for all N targets, then one shared SAM2 pass.
+    Returns list of (mask_hw_bool|None, meta) in the same order as batch_requests.
+    """
+    target_texts = [r[0] for r in batch_requests]
+
+    # Build combined query: "red box. white cube. blue cylinder."
+    combined_text = " ".join(
+        t if t.endswith(".") else t + "." for t in target_texts
+    )
+
+    _GLOBAL_MIN_THR = 0.05
+    inputs = processor(images=image_pil, text=combined_text, return_tensors="pt").to(device)
+    with torch.no_grad():
+        outputs = grounding_model(**inputs)
+    results = processor.post_process_grounded_object_detection(
+        outputs,
+        inputs.input_ids,
+        threshold=_GLOBAL_MIN_THR,
+        text_threshold=_GLOBAL_MIN_THR,
+        target_sizes=[image_pil.size[::-1]],
+    )
+    all_scores = results[0]["scores"].cpu().numpy()
+    all_boxes = results[0]["boxes"].cpu().numpy()
+    all_labels = [str(lbl) for lbl in results[0]["labels"]]
+    print(f"[batch_fused] GDino: {len(all_labels)} detections for {len(target_texts)} targets")
+
+    # Shared SAM2 image encoding
+    inference_state = video_predictor.non_video_path_init_state(
+        image_prepared, video_height, video_width
+    )
+
+    output_results = [None] * len(batch_requests)
+    obj_id_map = {}  # obj_id -> (req_idx, best_score, label, p_used)
+    next_obj_id = 1
+    used_det_indices: set = set()
+
+    for req_idx, (target_text, req_params, allow_fallback, fallback_steps) in enumerate(batch_requests):
+        threshold_seq = [req_params]
+        if allow_fallback and fallback_steps:
+            threshold_seq.extend(fallback_steps)
+
+        matching_dets = [
+            (float(all_scores[i]), all_boxes[i], all_labels[i], i)
+            for i in range(len(all_labels))
+            if _match_label_to_target(all_labels[i], target_text) and i not in used_det_indices
+        ]
+
+        if not matching_dets:
+            output_results[req_idx] = (None, {"ok": False, "reason": "no_boxes", "best_score": None, "params_used": req_params})
+            continue
+
+        placed = False
+        for level_idx, p in enumerate(threshold_seq):
+            box_thr = float(p.get("box_threshold", 0.35))
+            min_score = float(p.get("min_best_score", 0.35))
+            candidates = [(s, b, l, idx) for s, b, l, idx in matching_dets if s >= box_thr]
+            if not candidates:
+                continue
+            best_score, best_box, best_label, best_det_idx = max(candidates, key=lambda x: x[0])
+            if best_score < min_score:
+                continue
+            used_det_indices.add(best_det_idx)
+            obj_id = next_obj_id
+            next_obj_id += 1
+            video_predictor.add_new_points_or_box(
+                inference_state=inference_state, frame_idx=0, obj_id=obj_id, box=best_box,
+            )
+            obj_id_map[obj_id] = (req_idx, best_score, best_label, p, level_idx > 0)
+            placed = True
+            break
+
+        if not placed:
+            best_overall = max((s for s, _, _, _ in matching_dets), default=None)
+            output_results[req_idx] = (None, {"ok": False, "reason": "low_score", "best_score": best_overall, "params_used": threshold_seq[-1]})
+
+    if not obj_id_map:
+        for i in range(len(output_results)):
+            if output_results[i] is None:
+                output_results[i] = (None, {"ok": False, "reason": "unknown"})
+        return output_results
+
+    # One SAM2 propagation for all matched objects
+    video_segments = {}
+    for frame_idx, obj_ids, mask_logits in video_predictor.propagate_in_video(inference_state):
+        video_segments[frame_idx] = {
+            oid: (mask_logits[i] > 0.0).cpu().numpy()
+            for i, oid in enumerate(obj_ids)
+        }
+    segments = next(iter(video_segments.values())) if video_segments else {}
+
+    for obj_id, (req_idx, best_score, label, p_used, used_fallback) in obj_id_map.items():
+        mask_data = segments.get(obj_id)
+        if mask_data is None:
+            output_results[req_idx] = (None, {"ok": False, "reason": "propagate_no_mask", "best_score": best_score, "params_used": p_used})
+            continue
+        mask_hw = (np.any(mask_data, axis=0) if mask_data.ndim == 3 else mask_data).astype(np.bool_)
+        output_results[req_idx] = (mask_hw, {"ok": True, "reason": "ok", "best_score": best_score, "label": label, "params_used": p_used, "used_fallback": used_fallback})
+
+    for i in range(len(output_results)):
+        if output_results[i] is None:
+            output_results[i] = (None, {"ok": False, "reason": "unknown"})
+
+    return output_results
+
+
 # ---------------------------------------------------------------------------
 # Reply helpers (always 2 parts: meta_json + mask_bytes)
 # ---------------------------------------------------------------------------
@@ -326,24 +454,11 @@ def main():
         grounding_model = torch.compile(grounding_model)
 
     server_defaults = _default_server_params()
-<<<<<<< HEAD
-    # Keyed by target_text so each object label has its own tracking state.
-    inference_states: dict = {}
-    inference_state_holder = [None]  # legacy single-object tracking state
-    target_text_holder = [None]
 
     print(f"GSAM server ready on tcp://0.0.0.0:{args.port} (REP)")
 
     while True:
-        message_parts = socket.recv_multipart(flags=0)
-=======
-    print("GSAM server ready on tcp://0.0.0.0:8091 (REP)")
-    print(f"Default params: {server_defaults}")
-
-    while True:
-        print("Waiting for message...")
         message_parts = socket.recv_multipart()
->>>>>>> 208aa95659477a8c43c417265a8341c6243111dc
         if not message_parts:
             continue
 
@@ -355,7 +470,7 @@ def main():
                 json.dumps({
                     "ok": True,
                     "server": "grounded_sam_2",
-                    "protocols": ["segment", "set_config"],
+                    "protocols": ["segment", "batch_segment", "set_config"],
                 }).encode("utf-8")
             ])
             continue
@@ -416,6 +531,63 @@ def main():
             except Exception as e:
                 traceback.print_exc()
                 _reply_error(socket, f"server_error:{e}")
+            continue
+
+        # ---- batch_segment ----
+        if cmd == b"batch_segment":
+            if len(message_parts) < 3:
+                socket.send_multipart([json.dumps({"ok": False, "reason": "bad_batch_request", "results": []}).encode("utf-8")])
+                continue
+            try:
+                spec = json.loads(message_parts[1].decode("utf-8"))
+            except Exception as e:
+                socket.send_multipart([json.dumps({"ok": False, "reason": f"bad_json:{e}", "results": []}).encode("utf-8")])
+                continue
+            try:
+                requests_list = spec.get("requests") or []
+                if not requests_list:
+                    socket.send_multipart([json.dumps({"ok": False, "reason": "no_requests", "results": []}).encode("utf-8")])
+                    continue
+
+                image_pil = Image.open(io.BytesIO(message_parts[2]))
+                if image_pil.mode == "RGBA":
+                    image_pil = image_pil.convert("RGB")
+                image_prepared, video_height, video_width = load_single_image(
+                    image_pil, 1024, compute_device=device
+                )
+
+                batch_data = []
+                for req in requests_list:
+                    target_text = (req.get("target_text") or "").strip().lower()
+                    if not target_text.endswith("."):
+                        target_text += "."
+                    req_params = _merge_params(server_defaults, req.get("params") or {})
+                    allow_fallback = bool(req.get("allow_fallback", True))
+                    fallback_steps = req.get("fallback_steps") or DEFAULT_FALLBACK_STEPS
+                    batch_data.append((target_text, req_params, allow_fallback, fallback_steps))
+
+                fused_out = batch_segment_fused(
+                    processor, grounding_model, video_predictor, device,
+                    batch_data, image_pil, image_prepared, video_height, video_width,
+                )
+
+                results = []
+                mask_parts = []
+                for mask_hw, meta in fused_out:
+                    ok = mask_hw is not None and bool(meta.get("ok"))
+                    meta_out = _make_meta_out(meta, mask_hw)
+                    if ok:
+                        meta_out["mask_part_index"] = len(mask_parts)
+                        mask_parts.append((mask_hw.astype(np.uint8) * 255).tobytes())
+                    results.append(meta_out)
+
+                socket.send_multipart([
+                    json.dumps({"ok": True, "results": results}).encode("utf-8"),
+                    *mask_parts,
+                ])
+            except Exception as e:
+                traceback.print_exc()
+                socket.send_multipart([json.dumps({"ok": False, "reason": f"server_error:{e}", "results": []}).encode("utf-8")])
             continue
 
         # ---- unknown ----
