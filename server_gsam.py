@@ -630,10 +630,40 @@ def batch_first_step_fused(
     return output_results
 
 
+_SAM2_MODELS = {
+    "tiny":  ("./checkpoints/sam2.1_hiera_tiny.pt",  "configs/sam2.1/sam2.1_hiera_t.yaml"),
+    "small": ("./checkpoints/sam2.1_hiera_small.pt", "configs/sam2.1/sam2.1_hiera_s.yaml"),
+    "base":  ("./checkpoints/sam2.1_hiera_base_plus.pt", "configs/sam2.1/sam2.1_hiera_b+.yaml"),
+    "large": ("./checkpoints/sam2.1_hiera_large.pt", "configs/sam2.1/sam2.1_hiera_l.yaml"),
+}
+
+
 def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Grounded-SAM-2 ZMQ server")
+    parser.add_argument(
+        "--model-size",
+        choices=list(_SAM2_MODELS.keys()),
+        default="small",
+        help="SAM2 model size. 'tiny' is fastest; 'large' is most accurate.",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8091,
+        help="ZMQ REP port to bind.",
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Apply torch.compile to the grounding model for faster inference after warmup.",
+    )
+    args, _ = parser.parse_known_args()
+
     context = zmq.Context()
     socket = context.socket(zmq.REP)
-    socket.bind("tcp://0.0.0.0:8091")
+    socket.bind(f"tcp://0.0.0.0:{args.port}")
 
     # Detect backend: ROCm/HIP reports as CUDA in PyTorch but needs different flags.
     _is_rocm = hasattr(torch.version, "hip") and torch.version.hip is not None
@@ -655,8 +685,8 @@ def main():
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
 
-    sam2_checkpoint = "./checkpoints/sam2.1_hiera_small.pt"
-    model_cfg = "configs/sam2.1/sam2.1_hiera_s.yaml"
+    sam2_checkpoint, model_cfg = _SAM2_MODELS[args.model_size]
+    print(f"Loading SAM2 model: {args.model_size} ({sam2_checkpoint})")
 
     video_predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=device)
     sam2_image_model = build_sam2(model_cfg, sam2_checkpoint, device=device)
@@ -668,15 +698,19 @@ def main():
         model_id
     ).to(device)
 
+    if args.compile:
+        print("Applying torch.compile to grounding model (first inference will be slow)...")
+        grounding_model = torch.compile(grounding_model)
+
     server_defaults = _default_server_params()
     # Keyed by target_text so each object label has its own tracking state.
     inference_states: dict = {}
+    inference_state_holder = [None]  # legacy single-object tracking state
     target_text_holder = [None]
 
-    print("GSAM server ready on tcp://0.0.0.0:8091 (REP)")
+    print(f"GSAM server ready on tcp://0.0.0.0:{args.port} (REP)")
 
     while True:
-        print("Waiting for message")
         message_parts = socket.recv_multipart(flags=0)
         if not message_parts:
             continue
