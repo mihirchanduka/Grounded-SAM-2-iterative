@@ -242,10 +242,13 @@ def batch_segment_fused(
     """
     target_texts = [r[0] for r in batch_requests]
 
-    # Build combined query: "red box. white cube. blue cylinder."
-    combined_text = " ".join(
-        t if t.endswith(".") else t + "." for t in target_texts
-    )
+    # "object." is a catch-all wildcard — exclude it from the GDino query so it doesn't
+    # pollute token-span matching for the specific targets.  It will claim any unclaimed
+    # detections after the specific targets are placed.
+    _CATCHALL = "object"
+    specific_texts = [t for t in target_texts if t.strip().rstrip(".").lower() != _CATCHALL]
+    query_texts = specific_texts if specific_texts else target_texts
+    combined_text = " ".join(t if t.endswith(".") else t + "." for t in query_texts)
 
     _GLOBAL_MIN_THR = 0.05
     inputs = processor(images=image_pil, text=combined_text, return_tensors="pt").to(device)
@@ -261,7 +264,7 @@ def batch_segment_fused(
     all_scores = results[0]["scores"].cpu().numpy()
     all_boxes = results[0]["boxes"].cpu().numpy()
     all_labels = [str(lbl) for lbl in results[0]["labels"]]
-    print(f"[batch_fused] GDino: {len(all_labels)} detections for {len(target_texts)} targets")
+    print(f"[batch_fused] GDino: {len(all_labels)} detections for {len(query_texts)} specific targets")
 
     # Shared SAM2 image encoding
     inference_state = video_predictor.non_video_path_init_state(
@@ -278,11 +281,20 @@ def batch_segment_fused(
         if allow_fallback and fallback_steps:
             threshold_seq.extend(fallback_steps)
 
-        matching_dets = [
-            (float(all_scores[i]), all_boxes[i], all_labels[i], i)
-            for i in range(len(all_labels))
-            if _match_label_to_target(all_labels[i], target_text) and i not in used_det_indices
-        ]
+        is_catchall = target_text.strip().rstrip(".").lower() == _CATCHALL
+        if is_catchall:
+            # Wildcard: match any detection not already claimed by a specific target.
+            matching_dets = [
+                (float(all_scores[i]), all_boxes[i], all_labels[i], i)
+                for i in range(len(all_labels))
+                if i not in used_det_indices
+            ]
+        else:
+            matching_dets = [
+                (float(all_scores[i]), all_boxes[i], all_labels[i], i)
+                for i in range(len(all_labels))
+                if _match_label_to_target(all_labels[i], target_text) and i not in used_det_indices
+            ]
 
         if not matching_dets:
             output_results[req_idx] = (None, {"ok": False, "reason": "no_boxes", "best_score": None, "params_used": req_params})
