@@ -99,7 +99,7 @@ def first_step(
     results = processor.post_process_grounded_object_detection(
         outputs,
         inputs.input_ids,
-        threshold=float(p["box_threshold"]),
+        box_threshold=float(p["box_threshold"]),
         text_threshold=float(p["text_threshold"]),
         target_sizes=[image.size[::-1]],
     )
@@ -247,7 +247,7 @@ def first_step_multi(
     results = processor.post_process_grounded_object_detection(
         outputs,
         inputs.input_ids,
-        threshold=float(p["box_threshold"]),
+        box_threshold=float(p["box_threshold"]),
         text_threshold=float(p["text_threshold"]),
         target_sizes=[image.size[::-1]],
     )
