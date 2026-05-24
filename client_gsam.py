@@ -152,7 +152,7 @@ def send_instance_and_target(img, tar_string, socket):
 
 def collect_input_images() -> list[str]:
     exts = ("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG")
-    dataset_dir = Path("client_test/dataset")
+    dataset_dir = Path("client_demo/dataset")
     
     roots = [dataset_dir]
     if not dataset_dir.exists():
@@ -242,7 +242,7 @@ def make_seg_img(masks, image_path, tag=0, boxes=None):
     # Blend once at the end
     blended = cv2.addWeighted(img, 0.5, overlay, 0.5, 0)
     
-    cv2.imwrite(f"./client_test/output/segmented_{tag}.jpg", blended)
+    cv2.imwrite(f"./client_demo/output/segmented_{tag}.jpg", blended)
 
 def main():
     prep_and_send()
