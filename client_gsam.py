@@ -5,38 +5,49 @@ import numpy as np
 import cv2
 import json
 import random
+import shutil
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-#Get two segmentations of the same scene. Check each mask against each other mask. Remove masks that overlap too much from the all-mask.
-
-def track_two(image_1, image_2):
-    pass
-
-#Send it in both directions, keeping T-W and W-T. Then compare overlaps between the two T images and two W images.
-#The ids that overlap above a threshold will have their masks put together as a single object for both T and W. 
-#Mask by bits
-
 def normalize_gsam_target_name(raw: str) -> str:
+    """Normalize a target phrase for Grounding DINO.
+
+    Args:
+        raw (str): The user-provided text prompt.
+
+    Returns:
+        str: The normalized prompt, lowercased and ending with a period.
+    """
     t = (raw or "").strip().lower()
     if not t.endswith("."):
         t = t + "."
     return t
 
-
-def send_segment_v2(
+def send_segment_req(
     socket: zmq.Socket,
     image: Image.Image,
     target_text: str,
     mode: str,
     params: Optional[Dict[str, Any]] = None,
     allow_fallback: bool = True,
-    fallback_steps: Optional[list] = None,
+    fallback_steps: Optional[list[dict[str, Any]]] = None,
 ) -> Tuple[Dict[str, Any], Optional[np.ndarray]]:
     """
     New ZMQ protocol (pairs with server_gsam.py on port 8091):
       [b"segment", json_bytes, jpeg_bytes]
     Response: [json_bytes, mask_bytes] with mask uint8 (H,W) when ok.
+
+    Args:
+        socket (zmq.Socket): ZMQ REQ socket connected to the server.
+        image (Image.Image): PIL image to send for segmentation.
+        target_text (str): Text prompt for Grounding DINO.
+        mode (str): Server mode, typically "segment" or "track".
+        params (Optional[Dict[str, Any]]): Optional server-side segmentation parameters.
+        allow_fallback (bool): Whether the server may relax thresholds.
+        fallback_steps (Optional[list[dict[str, Any]]]): Optional fallback parameter sequence.
+
+    Returns:
+        Tuple[Dict[str, Any], Optional[np.ndarray]]: Response metadata and decoded mask, or None for the mask on failure.
     """
     if image.mode == "RGBA":
         image = image.convert("RGB")
@@ -63,138 +74,83 @@ def send_segment_v2(
     )
     return meta, mask
 
+def collect_input_image_groups(dataset_dir: Path) -> list[tuple[Path, list[Path]]]:
+    """Collect dataset images grouped by their parent folder.
 
-def push_server_config(socket: zmq.Socket, params: Dict[str, Any]) -> Dict[str, Any]:
-    socket.send_multipart([b"set_config", json.dumps(params).encode("utf-8")])
-    return json.loads(socket.recv_multipart()[0].decode("utf-8"))
-
-
-def remove_target_mask(instance_masks, target_mask, threshold=0.9):
-    """
-    Removes any mask in instance_masks that overlaps with the target_mask 
-    by >= threshold (default 90%).
-
-    Parameters:
-    - instance_masks: np.ndarray of shape [num_masks, height, width]
-                      Binary masks for each instance.
-    - target_mask: np.ndarray of shape [height, width]
-                   Binary mask to compare against.
-    - threshold: float, overlap ratio to trigger removal.
+    Args:
+        dataset_dir (Path): Root dataset directory.
 
     Returns:
-    - np.ndarray: Filtered instance_masks with overlapping masks removed.
+        list[tuple[Path, list[Path]]]: Sorted folder groups with sorted image paths.
     """
-    keep_masks = []
-    target_area = np.sum(target_mask)
-
-    for mask in instance_masks:
-        intersection = np.sum(mask * target_mask)
-        overlap_ratio = intersection / target_area if target_area > 0 else 0
-
-        if overlap_ratio < threshold:
-            keep_masks.append(mask)
-
-    return np.stack(keep_masks) if keep_masks else np.zeros((0, *target_mask.shape), dtype=instance_masks.dtype)
-
-def send_one(image, send_string, socket, force_segment=False, boxes_use=False):
-    """
-    Helper that maps a boolean segmentation/tracking intent to the new protocol.
-    Returns a mask batch with shape (N, H, W), where N is 0 or 1.
-    """
-    if boxes_use:
-        raise NotImplementedError("box return path not supported on current server reply.")
-    mode = "segment" if force_segment else "track"
-    meta, mask = send_segment_v2(socket, image, send_string, mode=mode)
-    print(f"Received metadata: {meta}")
-    if not meta.get("ok") or mask is None:
-        return np.zeros((0, 1, 1), dtype=np.uint8)
-    m = (mask > 127).astype(np.uint8) if mask.dtype == np.uint8 else (mask > 0.5).astype(np.uint8)
-    if m.ndim == 2:
-        m = m[np.newaxis, ...]
-    return m
-
-def instance_and_target_masks_to_one_mask(instance_mask, target_mask):
-    """
-    instance_mask = [masks, height, width] bool values
-    target_mask = [height, width] bool values
-
-    For each masks value, put it as the corresponding bit of a [height, width] as 1
-    All values at mask0 move 0+1
-    All values at mask1 move 1+1
-    etc
-    Keep the first as the target value
-
-    return encoded_instance_mask = [masks] of 32bit values
-    """
-    encoded_instance_mask = np.zeros((instance_mask.shape[1], instance_mask.shape[2]), dtype=np.int32) #[height, width]
-    for i in range(instance_mask.shape[0]):
-        encoded_instance_mask |= (instance_mask[i].astype(np.int32) << (i+1))
-    encoded_instance_mask |= (target_mask.astype(np.int32))
-
-    return encoded_instance_mask
-
-def send_instance_and_target(img, tar_string, socket):
-    mask_instance = send_one(img, "Object.", socket, force_segment=True)
-    mask_target = send_one(img, tar_string, socket, force_segment=True)
-    if mask_target.shape[0] == 0:
-        target_hw = np.zeros((1, 1), dtype=np.uint8)
-    else:
-        target_hw = mask_target[0]
-    mask_instance = remove_target_mask(mask_instance, target_hw)
-    if mask_instance.shape[0] == 0:
-        encoded_instance_mask = target_hw.astype(np.int32)
-    else:
-        encoded_instance_mask = instance_and_target_masks_to_one_mask(
-            mask_instance, target_hw
-        )
-    return mask_instance, mask_target, encoded_instance_mask
-
-
-def collect_input_images() -> list[str]:
-    exts = ("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG")
-    dataset_dir = Path("client_demo/dataset")
-    
-    roots = [dataset_dir]
     if not dataset_dir.exists():
         return []
 
-    paths: list[Path] = []
-    for root in roots:
-        if not root.exists():
+    grouped_paths: dict[Path, list[Path]] = {}
+    for image_path in sorted(dataset_dir.rglob("*")):
+        if not image_path.is_file() or image_path.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
             continue
-        for ext in exts:
-            paths.extend(root.glob(ext))
-        if paths:
-            break
+        rel_dir = image_path.parent.relative_to(dataset_dir)
+        grouped_paths.setdefault(rel_dir, []).append(image_path)
 
-    return [str(p) for p in sorted(paths)]
+    return [
+        (folder, sorted(paths))
+        for folder, paths in sorted(grouped_paths.items(), key=lambda item: str(item[0]))
+    ]
 
-def prep_and_send():
+
+def clean_output_dir(output_dir: Path) -> None:
+    """Remove any previous demo outputs and recreate the directory.
+
+    Args:
+        output_dir (Path): Directory that stores rendered outputs.
+    """
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+def segment_demo_images():
+    """Run the demo client over the dataset images.
+    """
     context = zmq.Context()
     socket = context.socket(zmq.REQ) #Make sure to use REQ
-    print("trying to connect to port")
+    print("Trying to connect to port")
     socket.connect("tcp://127.0.0.1:8091")
     print("Client connected")
-    paths = collect_input_images()
-    if not paths:
+    clean_output_dir(Path("client_demo/output"))
+    grouped_paths = collect_input_image_groups(Path("client_demo/dataset"))
+    if not grouped_paths:
         print("No images found in the dataset directory.")
         return
 
-    send_string = "Object."
-    for i, image_path in enumerate(paths):
-        image = Image.open(image_path)
-        force_segment = False
-        if i % 2 == 0: #Purposely want it to run object detection again when it is the first run, so I can keep the gsam running and continue restarting the object detection from there
-            force_segment = True
-        mode = "segment" if force_segment else "track"
-        meta, mask = send_segment_v2(socket, image, send_string, mode=mode)
-        print(meta)
-        if mask is None:
-            print("no mask")
-            continue
-        make_seg_img(np.stack([mask], axis=0), image_path, tag=i)
+    send_string = "Red cheezit box."
+    for folder_rel_path, image_paths in grouped_paths:
+        print(f"\nProcessing folder: {folder_rel_path}")
+        for index, image_path in enumerate(image_paths):
+            image = Image.open(image_path)
+            mode = "segment" if index == 0 else "track"
+            meta, mask = send_segment_req(socket, image, send_string, mode=mode)
+            print(meta)
+            if mask is None:
+                print("No mask")
+                continue
 
-def make_seg_img(masks, image_path, tag=0, boxes=None):
+            output_path = Path("client_demo/output") / folder_rel_path / f"segmented_{image_path.name}"
+            make_seg_img(np.stack([mask], axis=0), image_path, output_path)
+
+def make_seg_img(
+    masks: np.ndarray,
+    image_path: str,
+    output_path: Path,
+    boxes: Optional[np.ndarray] = None,
+):
+    """Render masks onto the source image and save the overlay.
+
+    Args:
+        masks (np.ndarray): Iterable of binary masks to draw.
+        image_path (str): Path to the source image.
+        boxes (Optional[np.ndarray]): Optional boxes to draw over the masks.
+    """
     img = cv2.imread(image_path)
     overlay = np.zeros_like(img, dtype=np.uint8)
     i = -1
@@ -242,10 +198,13 @@ def make_seg_img(masks, image_path, tag=0, boxes=None):
     # Blend once at the end
     blended = cv2.addWeighted(img, 0.5, overlay, 0.5, 0)
     
-    cv2.imwrite(f"./client_demo/output/segmented_{tag}.jpg", blended)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(output_path), blended)
 
 def main():
-    prep_and_send()
+    """Entry point for the client demo.
+    """
+    segment_demo_images()
 
 if __name__ == "__main__":
     main()

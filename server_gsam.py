@@ -1,6 +1,6 @@
 import io
 import json
-from typing import Optional
+from typing import Any, Optional
 
 import cv2
 import torch
@@ -16,12 +16,29 @@ from sam2.sam2_video_predictor import load_single_image
 import zmq
 
 
-def compute_area(box):
+def compute_area(box: Any) -> int:
+    """Compute the area of a box.
+
+    Args:
+        box (Any): A four-value box in x0, y0, x1, y1 order.
+
+    Returns:
+        int: The non-negative box area.
+    """
     x0, y0, x1, y1 = box
     return max(0, x1 - x0) * max(0, y1 - y0)
 
 
-def intersection_area(boxA, boxB):
+def intersection_area(boxA: Any, boxB: Any) -> int:
+    """Compute the intersection area between two boxes.
+
+    Args:
+        boxA (Any): First box in x0, y0, x1, y1 order.
+        boxB (Any): Second box in x0, y0, x1, y1 order.
+
+    Returns:
+        int: The overlapping area between the two boxes.
+    """
     x0 = max(boxA[0], boxB[0])
     y0 = max(boxA[1], boxB[1])
     x1 = min(boxA[2], boxB[2])
@@ -29,7 +46,17 @@ def intersection_area(boxA, boxB):
     return max(0, x1 - x0) * max(0, y1 - y0)
 
 
-def filter_boxes(boxes, threshold=0.9, max_inside=3):
+def filter_boxes(boxes: np.ndarray, threshold: float = 0.9, max_inside: int = 3) -> np.ndarray:
+    """Remove boxes that are overly contained by other boxes.
+
+    Args:
+        boxes (np.ndarray): Array-like set of candidate boxes.
+        threshold (float): Minimum overlap ratio to count as inside another box.
+        max_inside (int): Maximum number of other boxes a box may be inside.
+
+    Returns:
+        np.ndarray: A NumPy array of boxes that passed the filter.
+    """
     keep = []
     for i, A in enumerate(boxes):
         count = 0
@@ -46,7 +73,12 @@ def filter_boxes(boxes, threshold=0.9, max_inside=3):
     return np.array(keep) if keep else np.zeros((0, 4), dtype=np.float32)
 
 
-def _default_server_params():
+def _default_server_params() -> dict[str, Any]:
+    """Build the default server-side segmentation parameters.
+
+    Returns:
+        dict[str, Any]: A dictionary of default thresholds and tracking limits.
+    """
     return {
         "box_threshold": 0.2,
         "text_threshold": 0.25,
@@ -58,7 +90,16 @@ def _default_server_params():
     }
 
 
-def merge_gsam_params(base: dict, override: Optional[dict]) -> dict:
+def merge_gsam_params(base: dict[str, Any], override: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """Merge server defaults with request overrides.
+
+    Args:
+        base (dict[str, Any]): Base parameter dictionary.
+        override (Optional[dict[str, Any]]): Optional override dictionary.
+
+    Returns:
+        dict[str, Any]: A merged parameter dictionary.
+    """
     out = dict(base)
     if override:
         out.update(override)
@@ -66,23 +107,39 @@ def merge_gsam_params(base: dict, override: Optional[dict]) -> dict:
 
 
 def first_step(
-    processor,
-    grounding_model,
-    video_predictor,
-    image_predictor,
-    device,
-    text,
-    raw_image_inp,
-    image_inp,
-    video_height,
-    video_width,
-    p: dict,
-):
+    processor: Any,
+    grounding_model: Any,
+    video_predictor: Any,
+    image_predictor: Any,
+    device: str,
+    text: str,
+    raw_image_inp: Image.Image,
+    image_inp: Any,
+    video_height: int,
+    video_width: int,
+    p: dict[str, Any],
+) -> tuple[Optional[np.ndarray], Any, dict[str, Any]]:
     """
     GroundingDINO + SAM2 image + video init for one target (best-scoring box only).
     p keys: box_threshold, text_threshold, min_best_score, box_overlap_filter_threshold,
     max_inside, nms_iou_threshold (optional; NMS not applied on single best box path).
     Returns (mask_hw, inference_state, meta). mask_hw is bool (H,W) or None on failure.
+
+    Args:
+        processor (Any): Hugging Face processor for Grounding DINO.
+        grounding_model (Any): Grounding DINO detection model.
+        video_predictor (Any): SAM2 video predictor.
+        image_predictor (Any): SAM2 image predictor.
+        device (str): Torch device string.
+        text (str): Text prompt for object detection.
+        raw_image_inp (Image.Image): Original PIL image.
+        image_inp (Any): Preprocessed image tensor.
+        video_height (int): Video height in pixels.
+        video_width (int): Video width in pixels.
+        p (dict[str, Any]): Segmentation parameter dictionary.
+
+    Returns:
+        tuple[Optional[np.ndarray], Any, dict[str, Any]]: The best mask, updated inference state, and metadata.
     """
     meta = {"ok": False, "reason": "unknown", "best_score": None, "params_used": dict(p)}
 
@@ -208,7 +265,17 @@ def first_step(
     return mask_hw, inference_state, meta
 
 
-def update_inference_state(inference_state, frame, max_frames: int):
+def update_inference_state(inference_state: Any, frame: torch.Tensor, max_frames: int) -> Any:
+    """Append a frame to the rolling SAM2 inference state.
+
+    Args:
+        inference_state (Any): Current SAM2 state dictionary.
+        frame (torch.Tensor): New frame tensor to append.
+        max_frames (int): Maximum frames to keep in state.
+
+    Returns:
+        Any: The updated inference state.
+    """
     print("image shapes", inference_state["images"].shape, frame.shape)
     inference_state["images"] = torch.cat((inference_state["images"], frame), dim=0)
     inference_state["num_frames"] += 1
@@ -219,22 +286,38 @@ def update_inference_state(inference_state, frame, max_frames: int):
 
 
 def first_step_multi(
-    processor,
-    grounding_model,
-    video_predictor,
-    image_predictor,
-    device,
-    text,
-    raw_image_inp,
-    image_inp,
-    video_height,
-    video_width,
-    p: dict,
-):
+    processor: Any,
+    grounding_model: Any,
+    video_predictor: Any,
+    image_predictor: Any,
+    device: str,
+    text: str,
+    raw_image_inp: Image.Image,
+    image_inp: Any,
+    video_height: int,
+    video_width: int,
+    p: dict[str, Any],
+) -> tuple[list[tuple[np.ndarray, Any, int]], dict[str, Any]]:
     """
     Like first_step but keeps ALL boxes above min_best_score (not just the best one).
     Returns list of (mask_hw, inference_state, object_id) for each detected instance,
     plus meta dict. Each instance gets its own SAM2 inference state for independent tracking.
+
+    Args:
+        processor (Any): Hugging Face processor for Grounding DINO.
+        grounding_model (Any): Grounding DINO detection model.
+        video_predictor (Any): SAM2 video predictor.
+        image_predictor (Any): SAM2 image predictor.
+        device (str): Torch device string.
+        text (str): Text prompt for object detection.
+        raw_image_inp (Image.Image): Original PIL image.
+        image_inp (Any): Preprocessed image tensor.
+        video_height (int): Video height in pixels.
+        video_width (int): Video width in pixels.
+        p (dict[str, Any]): Segmentation parameter dictionary.
+
+    Returns:
+        tuple[list[tuple[np.ndarray, Any, int]], dict[str, Any]]: Detected instance list and metadata.
     """
     meta = {"ok": False, "reason": "unknown", "best_score": None, "params_used": dict(p)}
 
@@ -326,17 +409,28 @@ def first_step_multi(
 
 
 def init_from_mask_step(
-    video_predictor,
-    device,
-    mask_hw,
-    image_inp,
-    video_height,
-    video_width,
-):
+    video_predictor: Any,
+    device: str,
+    mask_hw: np.ndarray,
+    image_inp: Any,
+    video_height: int,
+    video_width: int,
+) -> tuple[Optional[np.ndarray], Any]:
     """
     Initialize a SAM2 tracking state on a new image using a mask from a prior detection.
     Used to bootstrap cam2 tracking from cam1's detection result.
     Returns (result_mask_hw, inference_state) or (None, None) on failure.
+
+    Args:
+        video_predictor (Any): SAM2 video predictor.
+        device (str): Torch device string.
+        mask_hw (np.ndarray): Binary mask to use as the prompt.
+        image_inp (Any): Preprocessed image tensor.
+        video_height (int): Video height in pixels.
+        video_width (int): Video width in pixels.
+
+    Returns:
+        tuple[Optional[np.ndarray], Any]: The propagated mask and updated inference state.
     """
     inference_state = video_predictor.non_video_path_init_state(
         image_inp, video_height, video_width
@@ -370,7 +464,23 @@ def init_from_mask_step(
     return result_mask, inference_state
 
 
-def new_frame(video_predictor, inference_state, new_frame_tensor, max_frames: int):
+def new_frame(
+    video_predictor: Any,
+    inference_state: Any,
+    new_frame_tensor: torch.Tensor,
+    max_frames: int,
+) -> tuple[Optional[np.ndarray], Any]:
+    """Advance tracking with a new frame and return the latest mask.
+
+    Args:
+        video_predictor (Any): SAM2 video predictor.
+        inference_state (Any): Current SAM2 state dictionary.
+        new_frame_tensor (torch.Tensor): New frame tensor to append.
+        max_frames (int): Maximum frames to keep in state.
+
+    Returns:
+        tuple[Optional[np.ndarray], Any]: The latest mask and the updated inference state.
+    """
     inference_state = update_inference_state(
         inference_state, new_frame_tensor, max_frames
     )
@@ -399,21 +509,40 @@ def new_frame(video_predictor, inference_state, new_frame_tensor, max_frames: in
 
 
 def run_segment_with_fallback(
-    processor,
-    grounding_model,
-    video_predictor,
-    image_predictor,
-    device,
-    text,
-    image_pil,
-    image_prepared,
-    video_height,
-    video_width,
-    base_params: dict,
+    processor: Any,
+    grounding_model: Any,
+    video_predictor: Any,
+    image_predictor: Any,
+    device: str,
+    text: str,
+    image_pil: Image.Image,
+    image_prepared: Any,
+    video_height: int,
+    video_width: int,
+    base_params: dict[str, Any],
     allow_fallback: bool,
-    fallback_steps: list,
-):
-    """Try segmentation with base_params, then optional relaxed steps."""
+    fallback_steps: list[dict[str, Any]],
+) -> tuple[Optional[np.ndarray], Any, dict[str, Any]]:
+    """Try segmentation with base_params, then optional relaxed steps.
+
+    Args:
+        processor (Any): Hugging Face processor for Grounding DINO.
+        grounding_model (Any): Grounding DINO detection model.
+        video_predictor (Any): SAM2 video predictor.
+        image_predictor (Any): SAM2 image predictor.
+        device (str): Torch device string.
+        text (str): Text prompt for object detection.
+        image_pil (Image.Image): Original PIL image.
+        image_prepared (Any): Preprocessed image tensor.
+        video_height (int): Video height in pixels.
+        video_width (int): Video width in pixels.
+        base_params (dict[str, Any]): Base segmentation parameter dictionary.
+        allow_fallback (bool): Whether relaxed retries are allowed.
+        fallback_steps (list[dict[str, Any]]): Ordered fallback parameter updates.
+
+    Returns:
+        tuple[Optional[np.ndarray], Any, dict[str, Any]]: Mask, inference state, and metadata for the best attempt.
+    """
     attempts = [merge_gsam_params(base_params, {})]
     if allow_fallback and fallback_steps:
         for step in fallback_steps:
@@ -461,7 +590,21 @@ def run_segment_with_fallback(
     return None, None, last_meta
 
 
-def _result_meta(meta: dict, mask_hw: Optional[np.ndarray], mask_part_index=None):
+def _result_meta(
+    meta: dict[str, Any],
+    mask_hw: Optional[np.ndarray],
+    mask_part_index: Optional[int] = None,
+) -> dict[str, Any]:
+    """Build a JSON-serializable response metadata dictionary.
+
+    Args:
+        meta (dict[str, Any]): Internal metadata dictionary.
+        mask_hw (Optional[np.ndarray]): Optional mask array.
+        mask_part_index (Optional[int]): Optional multipart mask index.
+
+    Returns:
+        dict[str, Any]: A response metadata dictionary.
+    """
     ok = mask_hw is not None and meta.get("ok")
     meta_out = {
         "ok": bool(ok),
@@ -478,7 +621,17 @@ def _result_meta(meta: dict, mask_hw: Optional[np.ndarray], mask_part_index=None
     return meta_out
 
 
-def _reply(socket, meta: dict, mask_hw: Optional[np.ndarray]):
+def _reply(socket: zmq.Socket, meta: dict[str, Any], mask_hw: Optional[np.ndarray]):
+    """Send a metadata-and-mask multipart response.
+
+    Args:
+        socket (zmq.Socket): ZMQ REP socket.
+        meta (dict[str, Any]): Internal metadata dictionary.
+        mask_hw (Optional[np.ndarray]): Optional mask array to serialize.
+
+    Returns:
+        None: Does not return anything.
+    """
     if mask_hw is not None and meta.get("ok"):
         mask_bytes = (mask_hw.astype(np.uint8) * 255).tobytes()
         meta_out = _result_meta(meta, mask_hw)
@@ -489,6 +642,8 @@ def _reply(socket, meta: dict, mask_hw: Optional[np.ndarray]):
 
 
 def main():
+    """Start the GSAM ZMQ server loop.
+    """
     context = zmq.Context()
     socket = context.socket(zmq.REP)
     socket.bind("tcp://0.0.0.0:8091")
@@ -919,7 +1074,15 @@ if __name__ == "__main__":
     main()
 
 
-def summarize_dict(data):
+def summarize_dict(data: dict[str, Any]) -> dict[str, Any]:
+    """Summarize nested tensors, arrays, and containers for debugging.
+
+    Args:
+        data (dict[str, Any]): Dictionary to summarize.
+
+    Returns:
+        dict[str, Any]: A dictionary with compact representations of nested values.
+    """
     def summarize_value(value):
         if isinstance(value, torch.Tensor):
             return f"Tensor shape: {tuple(value.shape)}"
@@ -937,7 +1100,21 @@ def summarize_dict(data):
     return {key: summarize_value(val) for key, val in data.items()}
 
 
-def convert_to_jpeg(png_path, jpeg_path, background_color=(255, 255, 255)):
+def convert_to_jpeg(
+    png_path: str,
+    jpeg_path: str,
+    background_color: tuple[int, int, int] = (255, 255, 255),
+) -> str:
+    """Convert a PNG image to JPEG, flattening alpha if needed.
+
+    Args:
+        png_path (str): Source PNG path.
+        jpeg_path (str): Destination JPEG path.
+        background_color (tuple[int, int, int]): RGB background used for alpha blending.
+
+    Returns:
+        str: The output JPEG path.
+    """
     with Image.open(png_path) as img:
         if img.mode in ("RGBA", "LA") or (
             img.mode == "P" and "transparency" in img.info
