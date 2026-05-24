@@ -34,6 +34,7 @@ var/
 wheels/
 pip-wheel-metadata/
 share/python-wheels/
+client_test/output/
 *.egg-info/
 .installed.cfg
 *.egg

@@ -1,0 +1,25 @@
+{
+  "name": "Grounded-SAM-2 Dev",
+  "initializeCommand": "bash -lc 'cd ${localWorkspaceFolder} && ./docker_build.sh'",
+  "image": "groundedsam:latest",
+  "runArgs": [
+    "--gpus",
+    "all"
+  ],
+  "workspaceMount": "source=${localWorkspaceFolder},target=/home/appuser/Grounded-SAM-2,type=bind",
+  "workspaceFolder": "/home/appuser/Grounded-SAM-2",
+  "forwardPorts": [8091],
+  "portsAttributes": {
+    "8091": {
+      "label": "Grounded-SAM-2 Service"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-toolsai.jupyter"
+      ]
+    }
+  }
+}

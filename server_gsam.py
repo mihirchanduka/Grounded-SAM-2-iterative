@@ -488,106 +488,6 @@ def _reply(socket, meta: dict, mask_hw: Optional[np.ndarray]):
     socket.send_multipart([json.dumps(meta_out).encode("utf-8"), mask_bytes])
 
 
-def _handle_legacy_request(
-    socket,
-    message_parts,
-    processor,
-    grounding_model,
-    video_predictor,
-    image_predictor,
-    device,
-    server_defaults: dict,
-    inference_state_holder: list,
-    target_text_holder: list,
-):
-    """
-    Legacy: [text_utf8, jpeg_bytes, one_byte_flag].
-    Flag 0x01 = force new segmentation (old 'do_not_track' True).
-    """
-    text_data = message_parts[0].decode("utf-8")
-    image_data = message_parts[1]
-    force_segment = False
-    if len(message_parts) >= 3:
-        force_segment = message_parts[2] == b"\x01"
-
-    image_pil = Image.open(io.BytesIO(image_data))
-    image_prepared, video_height, video_width = load_single_image(
-        image_pil, 1024, compute_device=device
-    )
-
-    if text_data:
-        target_text_holder[0] = text_data
-    text = target_text_holder[0]
-    if text is None:
-        _reply(socket, {"ok": False, "reason": "no_target_text"}, None)
-        return
-
-    max_f = int(server_defaults["max_frames_in_state"])
-    if force_segment or inference_state_holder[0] is None:
-        mask_hw, inf, meta = run_segment_with_fallback(
-            processor,
-            grounding_model,
-            video_predictor,
-            image_predictor,
-            device,
-            text,
-            image_pil,
-            image_prepared,
-            video_height,
-            video_width,
-            server_defaults,
-            allow_fallback=True,
-            fallback_steps=[
-                {
-                    "box_threshold": 0.12,
-                    "text_threshold": 0.18,
-                    "min_best_score": 0.22,
-                },
-                {
-                    "box_threshold": 0.08,
-                    "text_threshold": 0.12,
-                    "min_best_score": 0.12,
-                },
-            ],
-        )
-        if meta.get("ok"):
-            inference_state_holder[0] = inf
-        else:
-            inference_state_holder[0] = None
-        _reply(socket, meta, mask_hw)
-        return
-
-    mask_hw, inf = new_frame(
-        video_predictor,
-        inference_state_holder[0],
-        image_prepared,
-        max_f,
-    )
-    inference_state_holder[0] = inf
-    if mask_hw is None:
-        _reply(
-            socket,
-            {
-                "ok": False,
-                "reason": "tracking_failed",
-                "params_used": server_defaults,
-            },
-            None,
-        )
-        return
-    _reply(
-        socket,
-        {
-            "ok": True,
-            "reason": "ok",
-            "used_fallback": False,
-            "params_used": server_defaults,
-            "label": None,
-        },
-        mask_hw,
-    )
-
-
 def main():
     context = zmq.Context()
     socket = context.socket(zmq.REP)
@@ -1010,18 +910,8 @@ def main():
             _reply(socket, meta, result_mask)
             continue
 
-        # Legacy protocol
-        _handle_legacy_request(
-            socket,
-            message_parts,
-            processor,
-            grounding_model,
-            video_predictor,
-            image_predictor,
-            device,
-            server_defaults,
-            inference_state_holder,
-            target_text_holder,
+        socket.send_multipart(
+            [json.dumps({"ok": False, "reason": f"unknown_command:{cmd!r}"}).encode("utf-8")]
         )
 
 
