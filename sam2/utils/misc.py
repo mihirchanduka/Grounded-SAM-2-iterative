@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
+import io
 import warnings
 from threading import Thread
 
@@ -89,7 +90,7 @@ def mask_to_box(masks: torch.Tensor):
     return bbox_coords
 
 
-def _load_img_as_tensor(img_path, image_size):
+def _load_img_path_as_tensor(img_path, image_size):
     img_pil = Image.open(img_path)
     img_np = np.array(img_pil.convert("RGB").resize((image_size, image_size)))
     if img_np.dtype == np.uint8:  # np.uint8 is expected for JPEG images
@@ -100,7 +101,8 @@ def _load_img_as_tensor(img_path, image_size):
     video_width, video_height = img_pil.size  # the original video size
     return img, video_height, video_width
 
-def _load_img_as_tensor_no_path(img_pil, image_size):
+
+def _load_img_as_tensor(img_pil, image_size):
     #img_pil = Image.open(img_path)
     img_np = np.array(img_pil.convert("RGB").resize((image_size, image_size)))
     if img_np.dtype == np.uint8:  # np.uint8 is expected for JPEG images
@@ -110,6 +112,25 @@ def _load_img_as_tensor_no_path(img_pil, image_size):
     img = torch.from_numpy(img_np).permute(2, 0, 1)
     video_width, video_height = img_pil.size  # the original video size
     return img, video_height, video_width
+
+
+def _load_byte_img_as_tensor(img_data, image_size):
+    img_pil = Image.open(io.BytesIO(img_data))
+    img_np = np.array(img_pil.convert("RGB").resize((image_size, image_size)))
+    if img_np.dtype == np.uint8:  # np.uint8 is expected for JPEG images
+        img_np = img_np / 255.0
+    else:
+        raise RuntimeError(f"Unknown image dtype: {img_np.dtype}")
+    img = torch.from_numpy(img_np).permute(2, 0, 1)
+    video_width, video_height = img_pil.size  # the original video size
+
+    return img, video_height, video_width
+
+
+def _load_img_bytes_as_tensor(img_data, image_size):
+    # Backward-compatible alias.
+    return _load_byte_img_as_tensor(img_data, image_size)
+
 
 class AsyncVideoFrameLoader:
     """
@@ -162,7 +183,7 @@ class AsyncVideoFrameLoader:
         if img is not None:
             return img
 
-        img, video_height, video_width = _load_img_as_tensor(
+        img, video_height, video_width = _load_img_path_as_tensor(
             self.img_paths[index], self.image_size
         )
         self.video_height = video_height
@@ -205,7 +226,7 @@ def load_video_frames(
             compute_device=compute_device,
         )
     elif is_str and os.path.isdir(video_path):
-        return load_video_frames_from_jpg_images(
+        return load_video_frames_from_jpg_image_folder(
             video_path=video_path,
             image_size=image_size,
             offload_video_to_cpu=offload_video_to_cpu,
@@ -219,8 +240,95 @@ def load_video_frames(
             "Only MP4 video and JPEG folder are supported at this moment"
         )
 
+def load_video_frames_from_pil_images(
+    pil_images,
+    image_size,
+    offload_video_to_cpu,
+    img_mean=(0.485, 0.456, 0.406),
+    img_std=(0.229, 0.224, 0.225),
+    compute_device=torch.device("cuda"),
+):
+    """
+    Load video frames from a list/tuple of PIL images.
 
-def load_video_frames_from_jpg_images(
+    The frames are resized to image_size x image_size and are loaded to GPU if
+    `offload_video_to_cpu` is `False` and to CPU if `offload_video_to_cpu` is `True`.
+    """
+    if not isinstance(pil_images, (list, tuple)):
+        raise TypeError("pil_images must be a list or tuple of PIL.Image.Image")
+
+    num_frames = len(pil_images)
+    if num_frames == 0:
+        raise RuntimeError("no PIL images found")
+
+    img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
+    img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
+
+    images = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float32)
+    for n, img_pil in enumerate(tqdm(pil_images, desc="frame loading (PIL)")):
+        if not isinstance(img_pil, Image.Image):
+            raise TypeError(f"pil_images[{n}] is not a PIL.Image.Image")
+        images[n], video_height, video_width = _load_img_as_tensor(
+            img_pil, image_size
+        )
+
+    if not offload_video_to_cpu:
+        images = images.to(compute_device)
+        img_mean = img_mean.to(compute_device)
+        img_std = img_std.to(compute_device)
+
+    # normalize by mean and std
+    images -= img_mean
+    images /= img_std
+    return images, video_height, video_width
+
+
+def load_video_frames_from_byte_images(
+    byte_images,
+    image_size,
+    offload_video_to_cpu,
+    img_mean=(0.485, 0.456, 0.406),
+    img_std=(0.229, 0.224, 0.225),
+    compute_device=torch.device("cuda"),
+):
+    """
+    Load video frames from a list/tuple of encoded image bytes.
+
+    The frames are resized to image_size x image_size and are loaded to GPU if
+    `offload_video_to_cpu` is `False` and to CPU if `offload_video_to_cpu` is `True`.
+    """
+    if not isinstance(byte_images, (list, tuple)):
+        raise TypeError("byte_images must be a list or tuple of bytes-like objects")
+
+    num_frames = len(byte_images)
+    if num_frames == 0:
+        raise RuntimeError("no byte images found")
+
+    img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
+    img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
+
+    images = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float32)
+    for n, img_data in enumerate(tqdm(byte_images, desc="frame loading (bytes)")):
+        if not isinstance(img_data, (bytes, bytearray, memoryview)):
+            raise TypeError(
+                f"byte_images[{n}] is not bytes-like (bytes/bytearray/memoryview)"
+            )
+        images[n], video_height, video_width = _load_byte_img_as_tensor(
+            img_data, image_size
+        )
+
+    if not offload_video_to_cpu:
+        images = images.to(compute_device)
+        img_mean = img_mean.to(compute_device)
+        img_std = img_std.to(compute_device)
+
+    # normalize by mean and std
+    images -= img_mean
+    images /= img_std
+    return images, video_height, video_width
+
+
+def load_video_frames_from_jpg_image_folder(
     video_path,
     image_size,
     offload_video_to_cpu,
@@ -276,7 +384,7 @@ def load_video_frames_from_jpg_images(
 
     images = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float32)
     for n, img_path in enumerate(tqdm(img_paths, desc="frame loading (JPEG)")):
-        images[n], video_height, video_width = _load_img_as_tensor(img_path, image_size)
+        images[n], video_height, video_width = _load_img_path_as_tensor(img_path, image_size)
     if not offload_video_to_cpu:
         images = images.to(compute_device)
         img_mean = img_mean.to(compute_device)

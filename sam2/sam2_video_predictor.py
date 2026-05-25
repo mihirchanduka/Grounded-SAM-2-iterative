@@ -17,27 +17,8 @@ from sam2.utils.misc import concat_points, fill_holes_in_mask_scores, load_video
 from PIL import Image
 import io
 import numpy as np
-from sam2.utils.misc import load_video_frames_from_jpg_images, _load_img_as_tensor, _load_img_as_tensor_no_path
+from sam2.utils.misc import load_video_frames_from_jpg_image_folder, _load_img_path_as_tensor, _load_img_as_tensor
 
-def _load_img_bytes_as_tensor(img_data, image_size):
-    img_pil = Image.open(io.BytesIO(img_data))
-    img_np = np.array(img_pil.convert("RGB").resize((image_size, image_size)))
-    if img_np.dtype == np.uint8:  # np.uint8 is expected for JPEG images
-        img_np = img_np / 255.0
-    else:
-        raise RuntimeError(f"Unknown image dtype: {img_np.dtype}")
-    img = torch.from_numpy(img_np).permute(2, 0, 1)
-    video_width, video_height = img_pil.size  # the original video size
-
-    img = torch.zeros(1, 3, image_size, image_size, dtype=torch.float32)
-    img[0] = img
-    img_mean=(0.485, 0.456, 0.406)
-    img_std=(0.229, 0.224, 0.225)
-    img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
-    img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
-    img -= img_mean
-    img /= img_std
-    return img, video_height, video_width
 
 def load_single_image(
     img_pil,
@@ -58,7 +39,7 @@ def load_single_image(
     img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
 
     # Load the image as a tensor
-    image, video_height, video_width = _load_img_as_tensor_no_path(img_pil, image_size) #This was the key to properly loading JPEG images I am pretty sure. Or something here. 
+    image, video_height, video_width = _load_img_as_tensor(img_pil, image_size) #This was the key to properly loading JPEG images I am pretty sure. Or something here. 
 
     # Move to the appropriate device
     if not offload_to_cpu:
@@ -94,7 +75,7 @@ def load_single_image_using_path(
     img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
 
     # Load the image as a tensor
-    image, video_height, video_width = _load_img_as_tensor(img_path, image_size) #This was the key to properly loading JPEG images I am pretty sure. Or something here. 
+    image, video_height, video_width = _load_img_path_as_tensor(img_path, image_size) #This was the key to properly loading JPEG images I am pretty sure. Or something here. 
 
     # Move to the appropriate device
     if not offload_to_cpu:
@@ -194,11 +175,11 @@ class SAM2VideoPredictor(SAM2Base):
 
     #Simply input the image(s) here to the inference state
     @torch.inference_mode()
-    def non_video_path_init_state(
+    def init_state_from_tensor_images(
         self,
-        images,
-        video_height,
-        video_width,
+        images=None,
+        video_height=None,
+        video_width=None,
         offload_video_to_cpu=False,
         offload_state_to_cpu=False,
         async_loading_frames=False,
@@ -220,6 +201,13 @@ class SAM2VideoPredictor(SAM2Base):
         #         image_next, video_height, video_width = load_single_image(single_image_bytes[i], self.image_size)
         #         images = torch.cat((images, image_next), dim=0)
             
+        if images is None:
+            images = torch.empty((0, 3, self.image_size, self.image_size), dtype=torch.float32)
+        if video_height is None:
+            video_height = self.image_size
+        if video_width is None:
+            video_width = self.image_size
+
         print("self.image_size=", self.image_size)
         inference_state = {}
         inference_state["images"] = images
@@ -271,7 +259,46 @@ class SAM2VideoPredictor(SAM2Base):
         inference_state["tracking_has_started"] = False
         inference_state["frames_already_tracked"] = {}
         # Warm up the visual backbone and cache the image feature on frame 0
-        self._get_image_feature(inference_state, frame_idx=0, batch_size=1)
+        if inference_state["num_frames"] > 0:
+            self._get_image_feature(inference_state, frame_idx=0, batch_size=1)
+        return inference_state
+
+    @torch.inference_mode()
+    def state_append_images(self, inference_state, images, video_height=None, video_width=None):
+        """Append a tensor batch of frames with shape [N, 3, H, W] to inference_state."""
+        if images is None:
+            raise ValueError("images must not be None")
+        if not isinstance(images, torch.Tensor):
+            raise TypeError("images must be a torch.Tensor")
+        if images.ndim != 4:
+            raise ValueError("images must have shape [N, 3, H, W]")
+        if images.shape[1] != 3:
+            raise ValueError("images must have 3 channels")
+        if images.shape[0] == 0:
+            return inference_state
+
+        existing_images = inference_state["images"]
+        if not isinstance(existing_images, torch.Tensor):
+            raise TypeError("append_images requires tensor-backed inference_state['images']")
+
+        append_images = images.to(existing_images.device)
+        if append_images.dtype != existing_images.dtype:
+            append_images = append_images.to(existing_images.dtype)
+
+        if existing_images.numel() == 0:
+            inference_state["images"] = append_images
+        else:
+            inference_state["images"] = torch.cat([existing_images, append_images], dim=0)
+
+        inference_state["num_frames"] = len(inference_state["images"])
+        if video_height is not None:
+            inference_state["video_height"] = video_height
+        if video_width is not None:
+            inference_state["video_width"] = video_width
+
+        if len(inference_state["cached_features"]) == 0:
+            self._get_image_feature(inference_state, frame_idx=0, batch_size=1)
+
         return inference_state
 
     @torch.inference_mode()
@@ -287,7 +314,7 @@ class SAM2VideoPredictor(SAM2Base):
 
 
         #images, video_height, video_width = images_from_paths(image_paths, self.image_size)
-        images, video_height, video_width = load_video_frames_from_jpg_images(image_paths, self.image_size, False)
+        images, video_height, video_width = load_video_frames_from_jpg_image_folder(image_paths, self.image_size, False)
         
         inference_state = {}
         inference_state["images"] = images
