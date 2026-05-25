@@ -1,3 +1,216 @@
+"""GSAM ZMQ server API reference.
+
+Transport
+    - Endpoint: tcp://0.0.0.0:8091
+    - Pattern: ZMQ REP server; every request gets exactly one reply.
+    - Encoding:
+        - JSON frames are UTF-8 encoded bytes.
+        - Mask frames are raw bytes of row-major arrays.
+
+Request / reply framing
+    - Each request is multipart where frame 0 is the command bytes.
+    - Command names:
+        - b"set_config"
+        - b"segment_best"
+        - b"batch_segment_best"
+        - b"segment_instances"
+        - b"init_from_mask"
+
+Default server params
+    - box_threshold: 0.2
+    - text_threshold: 0.25
+    - min_best_score: 0.35
+    - box_overlap_filter_threshold: 0.9
+    - max_inside: 3
+    - max_frames_in_state: 2
+    - nms_iou_threshold: 0.7
+
+    
+Command: set_config
+    Update server-side default parameters for subsequent segmentation requests.
+
+    Request frames
+        1) b"set_config"
+        2) JSON object with partial param overrides
+
+    Behavior
+        - Merges provided keys into process-wide defaults.
+
+    Reply frames
+        1) JSON only
+
+    Reply JSON
+        - Success: {"ok": true, "applied": <merged defaults>}
+        - Failure: {"ok": false, "reason": "..."}
+
+Command: segment_best
+    Segments a single object from a still image that matches the target_text.
+    Ex. In psuedo code:
+        target_text="banana." should segment one banana instance if present.
+        Returns banana_mask.
+
+    Request frames
+        1) b"segment_best"
+        2) JSON spec
+        3) image bytes (any PIL-readable image)
+
+    Spec JSON fields
+        - mode: "segment" (default) or "track"
+        - target_text: string, required unless previously set in this process
+        - state_key: optional string key used to store/load tracking state
+        - params: optional object merged onto defaults
+        - allow_fallback: bool, default true
+        - fallback_steps: optional list of param patch objects; default:
+            - {"box_threshold": 0.12, "text_threshold": 0.18, "min_best_score": 0.22}
+            - {"box_threshold": 0.08, "text_threshold": 0.12, "min_best_score": 0.12}
+
+    Behavior
+        - mode="segment": detects from target_text, initializes SAM2 state, and returns mask.
+        - mode="track": advances previously stored state by state_key (or target_text fallback).
+        - If state_key is omitted for mode="segment", a state key is auto-generated.
+
+    Reply frames
+        1) JSON meta
+        2) mask bytes (empty on failure)
+
+    Reply JSON fields
+        - ok: bool
+        - reason: string
+        - used_fallback: bool
+        - params_used: object or null
+        - mask_dtype: "uint8" when ok else null
+        - mask_shape: [H, W] when ok else []
+        - best_score: number or null
+        - label: string or null
+        - state_key: string or null
+
+    Mask encoding
+        - Byte payload is uint8 mask where foreground is 255 and background is 0.
+        - Shape is provided by mask_shape.
+
+Command: batch_segment_best
+    Segments multiple objects from a still image that each match specific target_texts.
+    Ex. In psuedo code:
+        target_text=["banana.", "apple."] should segment a banana, and then an apple instance if present. 
+        Returns banana_mask, apple_mask, ...
+
+    Request frames
+        1) b"batch_segment_best"
+        2) JSON spec
+        3) image bytes
+
+    Spec JSON
+        - requests: list of request objects (required)
+
+    Per-request object fields
+        - mode: "segment" (default) or "track"
+        - target_text: string (required for mode="segment")
+        - state_key: optional string key used to store/load tracking state
+        - params: optional object merged onto defaults
+        - allow_fallback: bool, default true
+        - fallback_steps: optional list; same semantics as segment
+
+    Behavior
+        - Processes each request independently on the same image.
+        - Appends one mask part per successful request.
+
+    Reply frames
+        1) JSON: {"ok": true, "results": [...]} 
+        2..N) mask byte parts referenced by each result.mask_part_index
+
+    Per-result JSON fields
+        - ok: bool
+        - reason: string
+        - used_fallback: bool
+        - params_used: object or null
+        - mask_dtype: "uint8" or null
+        - mask_shape: [H, W] or []
+        - best_score: number or null
+        - label: string or null
+        - state_key: string or null
+        - mask_part_index: int (present only when mask exists)
+
+    Error replies
+        - bad JSON: {"ok": false, "reason": "bad_json:...", "results": []}
+        - missing requests: {"ok": false, "reason": "no_requests", "results": []}
+
+Command: segment_instances
+    Segments all instances from a still image that match the target_text, returning one mask per instance.
+    Ex. In psuedo code:
+        target_text="banana." should segment all banana instances if present. 
+        Returns banana_mask_1, banana_mask_2, ...
+
+    Request frames
+        1) b"segment_instances"
+        2) JSON spec
+        3) image bytes
+
+    Spec JSON fields
+        - target_text: string, default "object."
+        - params: optional object merged onto defaults
+        - state_key: optional base key for stored state keys
+
+    Behavior
+        - Detects all instances above threshold, not just the best instance.
+        - Creates one independent tracking state per returned instance.
+                - If state_key is provided and multiple instances are detected, keys become
+                    "{state_key}_inst{object_id}".
+                - If state_key is omitted, keys are auto-generated.
+
+    Reply frames (success)
+        1) JSON: {"ok": true, "num_instances": int, "results": [...]}
+        2..N) one mask part per result.mask_part_index
+
+    Per-result fields
+        - ok: true
+        - object_id: int
+        - state_key: string
+        - mask_dtype: "uint8"
+        - mask_shape: [H, W]
+        - mask_part_index: int
+
+    Failure reply
+        - JSON only: {"ok": false, "reason": "...", "results": []}
+
+Command: init_from_mask
+    Request frames
+        1) b"init_from_mask"
+        2) JSON spec
+        3) mask bytes
+        4) image bytes
+
+    Spec JSON fields
+        - mask_dtype: dtype string, default "uint8"
+        - mask_shape: [H, W] (required)
+        - state_key: string (required)
+
+    Behavior
+        - Decodes incoming mask from frame 3 using mask_dtype and mask_shape.
+        - If mask_dtype is "uint8", threshold is >127 to build boolean mask.
+        - Initializes a new tracking state from this mask on frame 4 image.
+        - Stores state under state_key.
+
+    Reply frames
+        1) JSON meta
+        2) mask bytes (empty on failure)
+
+    Failure cases
+        - bad_json: invalid spec JSON
+        - missing mask_shape or state_key
+        - init_from_mask_failed
+
+Common errors
+    - Unknown command: {"ok": false, "reason": "unknown_command:<repr>"}
+    - segment/track when no prior state: reason "no_state_need_segment"
+    - track without state_key/target_text fallback: reason "no_state_key_need_segment"
+    - tracking step failure: reason "tracking_failed"
+    - missing target text: reason "no_target_text"
+
+Notes
+    - State is in-process memory only. Restarting this server clears all states.
+    - target_text is cached across segment requests via target_text_holder.
+"""
+
 import io
 import json
 from typing import Any, Optional
@@ -615,6 +828,7 @@ def _result_meta(
         "mask_shape": list(mask_hw.shape) if ok else [],
         "best_score": meta.get("best_score"),
         "label": meta.get("label"),
+        "state_key": meta.get("state_key"),
     }
     if mask_part_index is not None:
         meta_out["mask_part_index"] = mask_part_index
@@ -682,9 +896,15 @@ def main():
     ).to(device)
 
     server_defaults = _default_server_params()
-    # Keyed by target_text so each object label has its own tracking state.
+    # Keyed by explicit state_key (or backward-compatible target_text fallback).
     inference_states: dict = {}
     target_text_holder = [None]
+    next_state_id = [1]
+
+    def allocate_state_key(prefix: str = "state") -> str:
+        key = f"{prefix}_{next_state_id[0]:06d}"
+        next_state_id[0] += 1
+        return key
 
     print("GSAM server ready on tcp://0.0.0.0:8091 (REP)")
 
@@ -717,7 +937,7 @@ def main():
                 )
             continue
 
-        if cmd == b"segment" and len(message_parts) >= 3:
+        if cmd == b"segment_best" and len(message_parts) >= 3:
             try:
                 spec = json.loads(message_parts[1].decode("utf-8"))
             except Exception as e:
@@ -731,11 +951,13 @@ def main():
             )
 
             mode = spec.get("mode", "segment")
+            requested_state_key = spec.get("state_key")
             target_text = spec.get("target_text") or target_text_holder[0]
-            if not target_text:
-                _reply(socket, {"ok": False, "reason": "no_target_text"}, None)
-                continue
-            target_text_holder[0] = target_text
+            if mode == "segment":
+                if not target_text:
+                    _reply(socket, {"ok": False, "reason": "no_target_text"}, None)
+                    continue
+                target_text_holder[0] = target_text
 
             req_params = merge_gsam_params(
                 server_defaults, spec.get("params") or {}
@@ -757,7 +979,19 @@ def main():
             max_f = int(req_params["max_frames_in_state"])
 
             if mode == "track":
-                state = inference_states.get(target_text)
+                track_state_key = requested_state_key or spec.get("target_text") or target_text_holder[0]
+                if not track_state_key:
+                    _reply(
+                        socket,
+                        {
+                            "ok": False,
+                            "reason": "no_state_key_need_segment",
+                            "params_used": req_params,
+                        },
+                        None,
+                    )
+                    continue
+                state = inference_states.get(track_state_key)
                 if state is None:
                     _reply(
                         socket,
@@ -775,7 +1009,7 @@ def main():
                     image_prepared,
                     max_f,
                 )
-                inference_states[target_text] = inf
+                inference_states[track_state_key] = inf
                 if mask_hw is None:
                     _reply(
                         socket,
@@ -794,34 +1028,37 @@ def main():
                     "params_used": req_params,
                     "best_score": None,
                     "label": None,
+                    "state_key": track_state_key,
                 }
                 _reply(socket, meta, mask_hw)
                 continue
-
-            # mode == segment
-            mask_hw, inf, meta = run_segment_with_fallback(
-                processor,
-                grounding_model,
-                video_predictor,
-                image_predictor,
-                device,
-                target_text,
-                image_pil,
-                image_prepared,
-                video_height,
-                video_width,
-                req_params,
-                allow_fallback,
-                fallback_steps,
-            )
-            if meta.get("ok"):
-                inference_states[target_text] = inf
             else:
-                inference_states.pop(target_text, None)
-            _reply(socket, meta, mask_hw)
-            continue
+                # mode == segment
+                state_key = requested_state_key or allocate_state_key("segment")
+                mask_hw, inf, meta = run_segment_with_fallback(
+                    processor,
+                    grounding_model,
+                    video_predictor,
+                    image_predictor,
+                    device,
+                    target_text,
+                    image_pil,
+                    image_prepared,
+                    video_height,
+                    video_width,
+                    req_params,
+                    allow_fallback,
+                    fallback_steps,
+                )
+                if meta.get("ok"):
+                    inference_states[state_key] = inf
+                else:
+                    inference_states.pop(state_key, None)
+                meta["state_key"] = state_key
+                _reply(socket, meta, mask_hw)
+                continue
 
-        if cmd == b"batch_segment" and len(message_parts) >= 3:
+        if cmd == b"batch_segment_best" and len(message_parts) >= 3:
             try:
                 spec = json.loads(message_parts[1].decode("utf-8"))
             except Exception as e:
@@ -856,7 +1093,8 @@ def main():
             for req in requests:
                 mode = req.get("mode", "segment")
                 target_text = req.get("target_text")
-                if not target_text:
+                requested_state_key = req.get("state_key")
+                if mode == "segment" and not target_text:
                     results.append(
                         _result_meta({"ok": False, "reason": "no_target_text"}, None)
                     )
@@ -881,7 +1119,20 @@ def main():
                 max_f = int(req_params["max_frames_in_state"])
 
                 if mode == "track":
-                    state = inference_states.get(target_text)
+                    track_state_key = requested_state_key or target_text
+                    if not track_state_key:
+                        results.append(
+                            _result_meta(
+                                {
+                                    "ok": False,
+                                    "reason": "no_state_key_need_segment",
+                                    "params_used": req_params,
+                                },
+                                None,
+                            )
+                        )
+                        continue
+                    state = inference_states.get(track_state_key)
                     if state is None:
                         results.append(
                             _result_meta(
@@ -900,7 +1151,7 @@ def main():
                         image_prepared,
                         max_f,
                     )
-                    inference_states[target_text] = inf
+                    inference_states[track_state_key] = inf
                     if mask_hw is None:
                         results.append(
                             _result_meta(
@@ -920,8 +1171,10 @@ def main():
                         "params_used": req_params,
                         "best_score": None,
                         "label": None,
+                        "state_key": track_state_key,
                     }
                 else:
+                    state_key = requested_state_key or allocate_state_key("batch")
                     mask_hw, inf, meta = run_segment_with_fallback(
                         processor,
                         grounding_model,
@@ -938,9 +1191,10 @@ def main():
                         fallback_steps,
                     )
                     if meta.get("ok"):
-                        inference_states[target_text] = inf
+                        inference_states[state_key] = inf
                     else:
-                        inference_states.pop(target_text, None)
+                        inference_states.pop(state_key, None)
+                    meta["state_key"] = state_key
 
                 if mask_hw is not None and meta.get("ok"):
                     mask_part_index = len(mask_parts)
@@ -957,7 +1211,7 @@ def main():
             )
             continue
 
-        if cmd == b"instance_segment" and len(message_parts) >= 3:
+        if cmd == b"segment_instances" and len(message_parts) >= 3:
             # Returns ALL detected instances as separate masks (not just best box)
             try:
                 spec = json.loads(message_parts[1].decode("utf-8"))
@@ -975,7 +1229,7 @@ def main():
 
             target_text = spec.get("target_text") or "object."
             req_params = merge_gsam_params(server_defaults, spec.get("params") or {})
-            state_key_prefix = spec.get("state_key_prefix", "")
+            requested_state_key = spec.get("state_key", "")
 
             instances, meta = first_step_multi(
                 processor, grounding_model, video_predictor, image_predictor,
@@ -992,8 +1246,15 @@ def main():
             # Store each instance's inference state with a unique key
             results = []
             mask_parts = []
+            multi_instances = len(instances) > 1
             for mask_hw, inf_state, obj_id in instances:
-                state_key = f"{state_key_prefix}{target_text}_inst{obj_id}"
+                if requested_state_key:
+                    if multi_instances:
+                        state_key = f"{requested_state_key}_inst{obj_id}"
+                    else:
+                        state_key = requested_state_key
+                else:
+                    state_key = allocate_state_key("instance")
                 inference_states[state_key] = inf_state
                 mask_part_index = len(mask_parts)
                 mask_parts.append((mask_hw.astype(np.uint8) * 255).tobytes())

@@ -4,7 +4,9 @@
   "image": "groundedsam:latest",
   "runArgs": [
     "--gpus",
-    "all"
+    "all",
+    "--publish",
+    "8091:8091"
   ],
   "workspaceMount": "source=${localWorkspaceFolder},target=/home/appuser/Grounded-SAM-2,type=bind",
   "workspaceFolder": "/home/appuser/Grounded-SAM-2",
