@@ -146,4 +146,4 @@ outputs/
 
 .idea/
 
-client_demo/output/
+zmq_api_demo/output/

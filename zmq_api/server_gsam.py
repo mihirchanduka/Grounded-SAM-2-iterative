@@ -1,29 +1,7 @@
-"""Minimal GSAM ZMQ server exposing only `segment_instances`.
-
-Protocol
-- Endpoint: tcp://0.0.0.0:8091 (REP)
-- Request multipart:
-  1) b"segment_instances"
-  2) JSON spec bytes
-  3..N) image bytes (each frame is any PIL-readable image)
-
-Spec JSON fields (all optional unless noted)
-- target_text (str, required): grounding text prompt, e.g. "car."
-- box_threshold (float, default 0.25)
-- text_threshold (float, default 0.25)
-- start_frame_idx (int, default 0): index in provided chunk used for grounding
-
-Reply multipart on success
-  1) JSON metadata
-  2..M) one uint16 instance mask per frame (shape HxW), indexed by `frame_parts`
-
-Reply multipart on failure
-  1) JSON metadata only
-"""
-
 import io
 import json
 import uuid
+import copy
 from typing import Any
 
 import numpy as np
@@ -83,6 +61,20 @@ class ServerGSAM:
             model_id
         ).to(self.device)
         self.inference_state_dict: dict[str, Any] = {}
+
+    def _state_metadata(self, state: Any) -> dict[str, Any]:
+        if not isinstance(state, dict):
+            return {
+                "video_height": None,
+                "video_width": None,
+                "num_frames": None,
+            }
+
+        return {
+            "video_height": state.get("video_height"),
+            "video_width": state.get("video_width"),
+            "num_frames": state.get("num_frames"),
+        }
 
     def _generate_state_key(self) -> str:
         return uuid.uuid4().hex
@@ -344,8 +336,120 @@ class ServerGSAM:
         else:
             self._reply({"ok": False, "reason": "invalid_mode", "state_key": state_key})
 
+    def _handle_copy_state(self, message_parts: list[bytes]) -> None:
+        if len(message_parts) < 2:
+            self._reply({"ok": False, "reason": "missing_spec"})
+            return
+
+        spec, parse_err = self._json_or_error(message_parts[1])
+        if parse_err:
+            self._reply({"ok": False, "reason": parse_err})
+            return
+
+        source_state_key = str(spec.get("source_state_key", "")).strip() if spec else ""
+        if not source_state_key:
+            self._reply({"ok": False, "reason": "missing_source_state_key"})
+            return
+
+        source_state = self.inference_state_dict.get(source_state_key)
+        if source_state is None:
+            self._reply(
+                {
+                    "ok": False,
+                    "reason": "source_state_not_found",
+                    "source_state_key": source_state_key,
+                }
+            )
+            return
+
+        new_state_key = str(spec.get("new_state_key", "")).strip() if spec else ""
+        if not new_state_key:
+            new_state_key = self._generate_state_key()
+
+        if new_state_key in self.inference_state_dict:
+            self._reply(
+                {
+                    "ok": False,
+                    "reason": "target_state_key_exists",
+                    "source_state_key": source_state_key,
+                    "state_key": new_state_key,
+                }
+            )
+            return
+
+        self.inference_state_dict[new_state_key] = copy.deepcopy(source_state)
+        self._reply(
+            {
+                "ok": True,
+                "reason": "ok",
+                "source_state_key": source_state_key,
+                "state_key": new_state_key,
+            }
+        )
+
+    def _handle_remove_state(self, message_parts: list[bytes]) -> None:
+        if len(message_parts) < 2:
+            self._reply({"ok": False, "reason": "missing_spec"})
+            return
+
+        spec, parse_err = self._json_or_error(message_parts[1])
+        if parse_err:
+            self._reply({"ok": False, "reason": parse_err})
+            return
+
+        state_key = str(spec.get("state_key", "")).strip() if spec else ""
+        if not state_key:
+            self._reply({"ok": False, "reason": "missing_state_key"})
+            return
+
+        if state_key not in self.inference_state_dict:
+            self._reply({"ok": False, "reason": "state_not_found", "state_key": state_key})
+            return
+
+        del self.inference_state_dict[state_key]
+        self._reply(
+            {
+                "ok": True,
+                "reason": "ok",
+                "state_key": state_key,
+                "num_states": len(self.inference_state_dict),
+            }
+        )
+
+    def _handle_remove_all_states(self, message_parts: list[bytes]) -> None:
+        # This command accepts no required payload and clears all cached states.
+        _ = message_parts
+        removed_count = len(self.inference_state_dict)
+        self.inference_state_dict.clear()
+        self._reply(
+            {
+                "ok": True,
+                "reason": "ok",
+                "removed_count": removed_count,
+                "num_states": 0,
+            }
+        )
+
+    def _handle_list_states(self, message_parts: list[bytes]) -> None:
+        _ = message_parts
+        states: dict[str, Any] = {}
+        for state_key, state in self.inference_state_dict.items():
+            states[str(state_key)] = self._state_metadata(state)
+
+        self._reply(
+            {
+                "ok": True,
+                "reason": "ok",
+                "num_states": len(states),
+                "states": states,
+            }
+        )
+
     def run(self) -> None:
-        print(f"GSAM server ready on {self.endpoint} (REP), command=segment_instances")
+        print(
+            f"GSAM server ready on {self.endpoint} (REP), "
+            "commands=segment_instances,copy_state,remove_state,remove_all_states,list_states"
+        )
         while True:
             message_parts = self.socket.recv_multipart(flags=0)
             if not message_parts:
@@ -355,6 +459,22 @@ class ServerGSAM:
             cmd = message_parts[0]
             if cmd == b"segment_instances":
                 self._handle_segment_instances(message_parts)
+                continue
+
+            if cmd == b"copy_state":
+                self._handle_copy_state(message_parts)
+                continue
+
+            if cmd == b"remove_state":
+                self._handle_remove_state(message_parts)
+                continue
+
+            if cmd == b"remove_all_states":
+                self._handle_remove_all_states(message_parts)
+                continue
+
+            if cmd == b"list_states":
+                self._handle_list_states(message_parts)
                 continue
 
             self._reply({"ok": False, "reason": f"unknown_command:{cmd!r}"})
