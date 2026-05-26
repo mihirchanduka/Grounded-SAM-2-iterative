@@ -147,3 +147,4 @@ outputs/
 .idea/
 
 zmq_api_demo/output/
+!zmq_api/test_client_gsam.py
