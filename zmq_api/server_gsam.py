@@ -15,6 +15,13 @@ from sam2.utils.misc import load_video_frames_from_pil_images
 from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 
 
+try:
+    profile  # type: ignore[name-defined]
+except NameError:
+    def profile(func):  # type: ignore[no-redef]
+        return func
+
+
 SAM2_MODELS: dict[str, tuple[str, str]] = {
     "tiny":      ("./checkpoints/sam2.1_hiera_tiny.pt",      "configs/sam2.1/sam2.1_hiera_t.yaml"),
     "small":     ("./checkpoints/sam2.1_hiera_small.pt",     "configs/sam2.1/sam2.1_hiera_s.yaml"),
@@ -24,6 +31,7 @@ SAM2_MODELS: dict[str, tuple[str, str]] = {
 
 
 class ServerGSAM:
+    @profile
     def __init__(
         self,
         endpoint: str = "tcp://0.0.0.0:8091",
@@ -94,6 +102,7 @@ class ServerGSAM:
             return
         self.socket.send_multipart([json.dumps(meta).encode("utf-8"), *parts])
 
+    @profile
     def _segment_and_track_chunk(
         self,
         *,
@@ -215,6 +224,7 @@ class ServerGSAM:
         }
         return meta, raw_parts, inference_state
 
+    @profile
     def _track_chunk_from_state(
         self,
         *,
@@ -276,6 +286,7 @@ class ServerGSAM:
         }
         return meta, raw_parts, inference_state
 
+    @profile
     def _handle_segment_instances(self, message_parts: list[bytes]) -> None:
         if len(message_parts) < 3:
             self._reply({"ok": False, "reason": "missing_spec_or_images"})
@@ -445,6 +456,7 @@ class ServerGSAM:
             }
         )
 
+    @profile
     def run(self) -> None:
         print(
             f"GSAM server ready on {self.endpoint} (REP), "
