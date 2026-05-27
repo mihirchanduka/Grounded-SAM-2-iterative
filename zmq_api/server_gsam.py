@@ -87,6 +87,18 @@ class ServerGSAM:
     def _generate_state_key(self) -> str:
         return uuid.uuid4().hex
 
+    @staticmethod
+    def _to_float_list(values: Any) -> list[float]:
+        if values is None:
+            return []
+        if isinstance(values, torch.Tensor):
+            values = values.detach().cpu().numpy()
+        try:
+            array = np.asarray(values, dtype=np.float32).reshape(-1)
+        except Exception:
+            return []
+        return [float(value) for value in array.tolist()]
+
     def _json_or_error(self, raw: bytes) -> tuple[dict[str, Any] | None, str | None]:
         try:
             obj = json.loads(raw.decode("utf-8"))
@@ -149,6 +161,7 @@ class ServerGSAM:
 
         boxes = det_results[0]["boxes"]
         labels = det_results[0]["labels"]
+        det_scores = self._to_float_list(det_results[0].get("scores"))
         if boxes.shape[0] == 0:
             return {
                 "ok": False,
@@ -158,12 +171,13 @@ class ServerGSAM:
             }, [], None
 
         self.image_predictor.set_image(np.array(det_image.convert("RGB")))
-        masks, _, _ = self.image_predictor.predict(
+        masks, _, mask_scores = self.image_predictor.predict(
             point_coords=None,
             point_labels=None,
             box=boxes,
             multimask_output=False,
         )
+        mask_scores = self._to_float_list(mask_scores)
 
         if masks.ndim == 2:
             masks = masks[None]
@@ -171,7 +185,15 @@ class ServerGSAM:
             masks = masks.squeeze(1)
 
         object_labels: dict[int, str] = {}
+        object_confidences: dict[int, dict[str, Any]] = {}
         for object_id, mask in enumerate(masks, start=1):
+            grounding_score = (
+                det_scores[object_id - 1] if object_id - 1 < len(det_scores) else None
+            )
+            sam_score = (
+                mask_scores[object_id - 1] if object_id - 1 < len(mask_scores) else None
+            )
+            confidence = sam_score if sam_score is not None else grounding_score
             self.video_predictor.add_new_mask(
                 inference_state=inference_state,
                 frame_idx=0,
@@ -179,6 +201,11 @@ class ServerGSAM:
                 mask=mask,
             )
             object_labels[object_id] = str(labels[object_id - 1])
+            object_confidences[object_id] = {
+                "confidence": confidence,
+                "grounding_score": grounding_score,
+                "sam_score": sam_score,
+            }
 
         frame_parts: list[dict[str, Any]] = []
         raw_parts: list[bytes] = []
@@ -218,6 +245,7 @@ class ServerGSAM:
             "num_frames": len(frame_parts),
             "num_instances": len(object_labels),
             "instance_labels": object_labels,
+            "instance_confidences": object_confidences,
             "mask_dtype": "uint16",
             "mask_shape": [int(video_height), int(video_width)],
             "frame_parts": frame_parts,
@@ -251,6 +279,7 @@ class ServerGSAM:
 
         frame_parts: list[dict[str, Any]] = []
         raw_parts: list[bytes] = []
+        object_confidences: dict[int, dict[str, Any]] = {}
         num_new_frames = int(frames_tensor.shape[0])
         
         iterator = self.video_predictor.propagate_in_video(
@@ -266,6 +295,16 @@ class ServerGSAM:
             for i, out_obj_id in enumerate(out_obj_ids):
                 out_mask = out_mask_logits[i] > 0.0
                 mask_img[out_mask[0]] = int(out_obj_id)
+                foreground_prob = torch.sigmoid(out_mask_logits[i])
+                if out_mask[0].any():
+                    confidence = float(foreground_prob[0][out_mask[0]].mean().item())
+                else:
+                    confidence = float(foreground_prob.mean().item())
+                object_confidences[int(out_obj_id)] = {
+                    "confidence": confidence,
+                    "grounding_score": None,
+                    "sam_score": confidence,
+                }
 
             part_index = len(raw_parts)
             raw_parts.append(mask_img.cpu().numpy().astype(np.uint16).tobytes())
@@ -280,6 +319,7 @@ class ServerGSAM:
             "num_frames": len(frame_parts),
             "num_instances": len(inference_state.get("obj_ids", [])),
             "instance_labels": {},
+            "instance_confidences": object_confidences,
             "mask_dtype": "uint16",
             "mask_shape": [int(video_height), int(video_width)],
             "frame_parts": frame_parts,
