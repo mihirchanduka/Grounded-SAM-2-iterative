@@ -1,5 +1,6 @@
 import io
 import json
+import time
 import uuid
 import copy
 from typing import Any
@@ -328,6 +329,7 @@ class ServerGSAM:
 
     @profile
     def _handle_segment_instances(self, message_parts: list[bytes]) -> None:
+        t_handler_start = time.perf_counter()
         if len(message_parts) < 3:
             self._reply({"ok": False, "reason": "missing_spec_or_images"})
             return
@@ -342,6 +344,7 @@ class ServerGSAM:
         if not state_key:
             state_key = self._generate_state_key()
 
+        t_decode0 = time.perf_counter()
         try:
             pil_images = [
                 Image.open(io.BytesIO(part)).convert("RGB")
@@ -350,6 +353,19 @@ class ServerGSAM:
         except Exception as exc:
             self._reply({"ok": False, "reason": f"bad_image_bytes:{exc}"})
             return
+        img_decode_ms = (time.perf_counter() - t_decode0) * 1e3
+
+        def _add_timing(meta: dict[str, Any], compute_ms: float) -> dict[str, Any]:
+            # Timing the server pays (excludes ZMQ wire time): pure model compute,
+            # server-side JPEG decode, and total handler time. The client subtracts
+            # server_total_ms from its round-trip to isolate transfer overhead.
+            meta["mode_timed"] = mode
+            meta["server_img_decode_ms"] = round(img_decode_ms, 2)
+            meta["server_compute_ms"] = round(compute_ms, 2)
+            meta["server_total_ms"] = round(
+                (time.perf_counter() - t_handler_start) * 1e3, 2
+            )
+            return meta
 
         if mode == "segment":
             target_text = str(spec.get("target_text", "")).strip()
@@ -360,6 +376,7 @@ class ServerGSAM:
             box_threshold = float(spec.get("box_threshold", 0.25))
             text_threshold = float(spec.get("text_threshold", 0.25))
             # Segment on the first image, then track the rest of the chunk.
+            t_c0 = time.perf_counter()
             meta, raw_parts, inference_state = self._segment_and_track_chunk(
                 target_text=target_text,
                 pil_images=pil_images,
@@ -367,23 +384,26 @@ class ServerGSAM:
                 text_threshold=text_threshold,
                 start_frame_idx=0,
             )
+            compute_ms = (time.perf_counter() - t_c0) * 1e3
             if meta.get("ok") and inference_state is not None:
                 self.inference_state_dict[state_key] = inference_state
             meta["state_key"] = state_key
-            self._reply(meta, raw_parts)
+            self._reply(_add_timing(meta, compute_ms), raw_parts)
         elif mode == "track":
             existing_state = self.inference_state_dict.get(state_key)
             if existing_state is None:
                 self._reply({"ok": False, "reason": "state_not_found", "state_key": state_key})
                 return
+            t_c0 = time.perf_counter()
             meta, raw_parts, updated_state = self._track_chunk_from_state(
                 inference_state=existing_state,
                 pil_images=pil_images,
             )
+            compute_ms = (time.perf_counter() - t_c0) * 1e3
             if meta.get("ok") and updated_state is not None:
                 self.inference_state_dict[state_key] = updated_state
             meta["state_key"] = state_key
-            self._reply(meta, raw_parts)
+            self._reply(_add_timing(meta, compute_ms), raw_parts)
         else:
             self._reply({"ok": False, "reason": "invalid_mode", "state_key": state_key})
 
