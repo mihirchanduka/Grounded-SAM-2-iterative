@@ -3,6 +3,7 @@ import json
 import time
 import uuid
 import copy
+import zlib
 from typing import Any
 
 import numpy as np
@@ -354,18 +355,25 @@ class ServerGSAM:
             self._reply({"ok": False, "reason": f"bad_image_bytes:{exc}"})
             return
         img_decode_ms = (time.perf_counter() - t_decode0) * 1e3
+        # Only compress/shrink masks when the client advertised support, so an
+        # older client (no flag) still gets the legacy uint16 raw payload.
+        accept_compression = bool(spec.get("accept_compression")) if spec else False
 
-        def _add_timing(meta: dict[str, Any], compute_ms: float) -> dict[str, Any]:
-            # Timing the server pays (excludes ZMQ wire time): pure model compute,
-            # server-side JPEG decode, and total handler time. The client subtracts
-            # server_total_ms from its round-trip to isolate transfer overhead.
+        def _finish(meta: dict[str, Any], compute_ms: float, raw_parts) -> None:
+            # Shrink the returned label masks (uint16 raw -> uint8 + zlib) before
+            # the timing snapshot, since that compression is real server work and
+            # the whole point is to cut wire bytes. A label image is mostly one
+            # value, so zlib typically shrinks it 10-50x for ~1-3ms.
+            if accept_compression and raw_parts:
+                raw_parts = self._compress_mask_parts(meta, raw_parts)
+            # Timing the server pays (excludes ZMQ wire time).
             meta["mode_timed"] = mode
             meta["server_img_decode_ms"] = round(img_decode_ms, 2)
             meta["server_compute_ms"] = round(compute_ms, 2)
             meta["server_total_ms"] = round(
                 (time.perf_counter() - t_handler_start) * 1e3, 2
             )
-            return meta
+            self._reply(meta, raw_parts)
 
         if mode == "segment":
             target_text = str(spec.get("target_text", "")).strip()
@@ -388,7 +396,7 @@ class ServerGSAM:
             if meta.get("ok") and inference_state is not None:
                 self.inference_state_dict[state_key] = inference_state
             meta["state_key"] = state_key
-            self._reply(_add_timing(meta, compute_ms), raw_parts)
+            _finish(meta, compute_ms, raw_parts)
         elif mode == "track":
             existing_state = self.inference_state_dict.get(state_key)
             if existing_state is None:
@@ -403,9 +411,120 @@ class ServerGSAM:
             if meta.get("ok") and updated_state is not None:
                 self.inference_state_dict[state_key] = updated_state
             meta["state_key"] = state_key
-            self._reply(_add_timing(meta, compute_ms), raw_parts)
+            _finish(meta, compute_ms, raw_parts)
         else:
             self._reply({"ok": False, "reason": "invalid_mode", "state_key": state_key})
+
+    @staticmethod
+    def _compress_mask_parts(meta: dict[str, Any], raw_parts: list[bytes]) -> list[bytes]:
+        """uint16 raw mask bytes -> uint8 (when ids fit) + zlib. Updates meta in place.
+
+        Centralized here so the segment/track builders stay unchanged; the cost is
+        one extra frombuffer + a cheap dtype cast on the server, far less than the
+        wire time it saves. Falls back to no-op (returns input) if anything is off.
+        """
+        shape = meta.get("mask_shape")
+        if not shape or len(shape) != 2:
+            return raw_parts
+        src_dtype = np.dtype(meta.get("mask_dtype", "uint16"))
+        try:
+            arrs = [np.frombuffer(p, dtype=src_dtype).reshape(shape) for p in raw_parts]
+        except Exception:
+            return raw_parts
+        max_id = max((int(a.max(initial=0)) for a in arrs), default=0)
+        out_dtype = np.uint8 if max_id < 256 else np.uint16
+        compressed = [
+            zlib.compress(a.astype(out_dtype, copy=False).tobytes(), 1) for a in arrs
+        ]
+        meta["mask_dtype"] = "uint8" if out_dtype is np.uint8 else "uint16"
+        meta["mask_compression"] = "zlib"
+        return compressed
+
+    @profile
+    def _handle_track_multi(self, message_parts: list[bytes]) -> None:
+        """Track several inference states on ONE uploaded image in a single
+        round-trip. The client uses this to fetch a camera's target + instance
+        masks together instead of two separate calls (one image upload, one RTT).
+        Reply: meta.results[i] = {state_key, ok, mask_part_index, ...}; raw_parts
+        holds the (optionally compressed) masks indexed by mask_part_index.
+        """
+        t_handler_start = time.perf_counter()
+        if len(message_parts) < 3:
+            self._reply({"ok": False, "reason": "missing_spec_or_images"})
+            return
+        spec, parse_err = self._json_or_error(message_parts[1])
+        if parse_err:
+            self._reply({"ok": False, "reason": parse_err})
+            return
+        state_keys = spec.get("state_keys", []) if spec else []
+        if not isinstance(state_keys, list) or not state_keys:
+            self._reply({"ok": False, "reason": "missing_state_keys"})
+            return
+        accept_compression = bool(spec.get("accept_compression")) if spec else False
+
+        t_decode0 = time.perf_counter()
+        try:
+            pil_images = [
+                Image.open(io.BytesIO(part)).convert("RGB")
+                for part in message_parts[2:]
+            ]
+        except Exception as exc:
+            self._reply({"ok": False, "reason": f"bad_image_bytes:{exc}"})
+            return
+        img_decode_ms = (time.perf_counter() - t_decode0) * 1e3
+
+        results: list[dict[str, Any]] = []
+        raw_parts: list[bytes] = []
+        mask_shape = None
+        compute_ms = 0.0
+        for raw_key in state_keys:
+            sk = str(raw_key).strip()
+            existing = self.inference_state_dict.get(sk)
+            if existing is None:
+                results.append(
+                    {"state_key": sk, "ok": False, "reason": "state_not_found",
+                     "mask_part_index": None}
+                )
+                continue
+            t_c0 = time.perf_counter()
+            meta_i, raw_i, updated = self._track_chunk_from_state(
+                inference_state=existing, pil_images=pil_images
+            )
+            compute_ms += (time.perf_counter() - t_c0) * 1e3
+            if not meta_i.get("ok") or updated is None or not raw_i:
+                results.append(
+                    {"state_key": sk, "ok": False,
+                     "reason": meta_i.get("reason", "track_failed"),
+                     "mask_part_index": None}
+                )
+                continue
+            self.inference_state_dict[sk] = updated
+            mask_shape = meta_i.get("mask_shape")
+            part_index = len(raw_parts)
+            raw_parts.append(raw_i[0])  # single image -> single mask part per state
+            results.append(
+                {"state_key": sk, "ok": True, "reason": "ok",
+                 "num_instances": meta_i.get("num_instances", 0),
+                 "instance_labels": meta_i.get("instance_labels", {}),
+                 "instance_confidences": meta_i.get("instance_confidences", {}),
+                 "mask_part_index": part_index}
+            )
+
+        meta: dict[str, Any] = {
+            "ok": any(r["ok"] for r in results),
+            "results": results,
+            "mask_dtype": "uint16",
+            "mask_shape": mask_shape,
+        }
+        if accept_compression and raw_parts:
+            raw_parts = self._compress_mask_parts(meta, raw_parts)
+        meta["mode_timed"] = "track_multi"
+        meta["server_img_decode_ms"] = round(img_decode_ms, 2)
+        meta["server_compute_ms"] = round(compute_ms, 2)
+        meta["server_total_ms"] = round(
+            (time.perf_counter() - t_handler_start) * 1e3, 2
+        )
+        self._reply(meta, raw_parts)
 
     def _handle_copy_state(self, message_parts: list[bytes]) -> None:
         if len(message_parts) < 2:
@@ -531,6 +650,10 @@ class ServerGSAM:
             cmd = message_parts[0]
             if cmd == b"segment_instances":
                 self._handle_segment_instances(message_parts)
+                continue
+
+            if cmd == b"track_multi":
+                self._handle_track_multi(message_parts)
                 continue
 
             if cmd == b"copy_state":
