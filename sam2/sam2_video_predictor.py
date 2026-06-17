@@ -285,21 +285,79 @@ class SAM2VideoPredictor(SAM2Base):
         if append_images.dtype != existing_images.dtype:
             append_images = append_images.to(existing_images.dtype)
 
+        n_new = int(append_images.shape[0])
         if existing_images.numel() == 0:
-            inference_state["images"] = append_images
+            combined = append_images
+            prev_logical = 0
         else:
-            inference_state["images"] = torch.cat([existing_images, append_images], dim=0)
+            combined = torch.cat([existing_images, append_images], dim=0)
+            prev_logical = int(inference_state["num_frames"])
 
-        inference_state["num_frames"] = len(inference_state["images"])
+        # num_frames is the LOGICAL count of frames ever appended (frame indices
+        # keep increasing). It is decoupled from how many frame tensors we keep
+        # in inference_state["images"] so old frames can be released below.
+        new_logical = prev_logical + n_new
+        inference_state["num_frames"] = new_logical
+
+        # --- Bounded streaming window (opt-in via self.streaming_keep_recent) ---
+        # Forward-only streaming never re-reads an old frame's pixels: only the
+        # frame currently being tracked is fetched in _get_image_feature, and the
+        # past lives in the memory bank as encoded features. Without a bound,
+        # torch.cat over the full history is O(n) per append (O(n^2) per episode)
+        # and the raw-frame + encoded-memory buffers grow without limit. Cap both
+        # to a window well past SAM2's attention reach (num_maskmem ~10 frames
+        # back; object pointers max_obj_ptrs_in_encoder=16 frames back).
+        keep_recent = int(getattr(self, "streaming_keep_recent", 0) or 0)
+        base = int(inference_state.get("images_offset", 0))
+        if keep_recent > 0 and combined.shape[0] > keep_recent:
+            drop = combined.shape[0] - keep_recent
+            combined = combined[drop:]
+            base += drop
+        inference_state["images"] = combined
+        inference_state["images_offset"] = base
+        if keep_recent > 0:
+            self._release_old_non_cond_frames(inference_state, new_logical - keep_recent)
+        # ------------------------------------------------------------------------
+
         if video_height is not None:
             inference_state["video_height"] = video_height
         if video_width is not None:
             inference_state["video_width"] = video_width
 
-        if len(inference_state["cached_features"]) == 0:
+        # Warm the frame-0 feature cache on a fresh state only (offset==0 keeps
+        # the absolute->physical index mapping a no-op here).
+        if len(inference_state["cached_features"]) == 0 and base == 0:
             self._get_image_feature(inference_state, frame_idx=0, batch_size=1)
 
         return inference_state
+
+    def _release_old_non_cond_frames(self, inference_state, min_keep_idx):
+        """Drop encoded outputs for non-conditioning frames older than
+        min_keep_idx so the memory bank stays bounded during long streaming.
+
+        Conditioning frames (the seeded-mask frames) are ALWAYS kept — they have
+        t_pos=0 in memory attention and are few. Safe to drop older non-cond
+        frames because attention only reads the last num_maskmem (~10) memories
+        and object pointers from the last max_obj_ptrs_in_encoder (16) frames;
+        callers keep a window comfortably larger than both.
+        """
+        if min_keep_idx <= 0:
+            return
+
+        def _prune_dict(d):
+            for t in [k for k in d.keys() if k < min_keep_idx]:
+                d.pop(t, None)
+
+        output_dict = inference_state["output_dict"]
+        _prune_dict(output_dict["non_cond_frame_outputs"])
+        for obj_output_dict in inference_state["output_dict_per_obj"].values():
+            _prune_dict(obj_output_dict["non_cond_frame_outputs"])
+        # Per-frame tracking bookkeeping (only ever read for the current frame).
+        _prune_dict(inference_state["frames_already_tracked"])
+        # Consolidated non-cond set is normally empty in streaming; keep it tidy.
+        non_cond_inds = inference_state["consolidated_frame_inds"]["non_cond_frame_outputs"]
+        for t in {k for k in non_cond_inds if k < min_keep_idx}:
+            non_cond_inds.discard(t)
 
     @torch.inference_mode()
     def init_state_joe(
@@ -1284,7 +1342,10 @@ class SAM2VideoPredictor(SAM2Base):
         if backbone_out is None:
             # Cache miss -- we will run inference on a single image
             device = inference_state["device"]
-            image = inference_state["images"][frame_idx].to(device).float().unsqueeze(0)
+            # Streaming may keep only a bounded window of recent frames (see
+            # state_append_images); map the absolute frame_idx into that window.
+            phys_idx = frame_idx - int(inference_state.get("images_offset", 0))
+            image = inference_state["images"][phys_idx].to(device).float().unsqueeze(0)
             backbone_out = self.forward_image(image)
             # Cache the most recent frame's feature (for repeated interactions with
             # a frame; we can use an LRU cache for more frames in the future).

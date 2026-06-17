@@ -62,6 +62,12 @@ class ServerGSAM:
         self.video_predictor = build_sam2_video_predictor(
             model_cfg, sam2_checkpoint, device=self.device
         )
+        # Bound the per-state streaming memory: keep only the most recent N frames
+        # of raw pixels + encoded memory so a long episode doesn't make
+        # state_append_images O(n) per call (O(n^2) total) and leak GPU/CPU memory.
+        # 32 is well past SAM2's attention reach (num_maskmem ~10, obj-ptrs 16),
+        # so tracking quality is unchanged. Set 0 to disable (unbounded/legacy).
+        self.video_predictor.streaming_keep_recent = 32
         sam2_image_model = build_sam2(model_cfg, sam2_checkpoint, device=self.device)
         self.image_predictor = SAM2ImagePredictor(sam2_image_model)
 
@@ -370,9 +376,17 @@ class ServerGSAM:
         self._cuda_sync()
         propagate_ms = (time.perf_counter() - t_prop0) * 1e3
         num_objects = len(inference_state.get("obj_ids", []))
+        # stored = physically retained frames (bounded by streaming_keep_recent);
+        # mem_frames = logical frames seen so far. With the window on, `stored`
+        # plateaus while `mem_frames` keeps climbing, and append/propagate stop
+        # scaling. If `stored` keeps growing too, the bound is off.
+        try:
+            stored = int(inference_state["images"].shape[0])
+        except Exception:
+            stored = -1
         print(
             f"[server track] state={state_key or '?'} mem_frames={prev_num_frames} "
-            f"objects={num_objects} new_frames={num_new_frames} | "
+            f"stored={stored} objects={num_objects} new_frames={num_new_frames} | "
             f"load={load_ms:.0f}ms append={append_ms:.0f}ms "
             f"propagate={propagate_ms:.0f}ms tracked={tracked_any}",
             flush=True,
