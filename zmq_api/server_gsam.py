@@ -117,6 +117,16 @@ class ServerGSAM:
         self.socket.send_multipart([json.dumps(meta).encode("utf-8"), *parts])
 
     @profile
+    def _cuda_sync(self) -> None:
+        """Block until queued GPU work finishes so perf_counter timings are real.
+
+        CUDA kernels launch asynchronously, so without this the time of a GPU op
+        gets misattributed to whatever later call happens to sync (e.g. a .cpu()).
+        No-op on CPU. Cheap relative to the model work being timed.
+        """
+        if self.device == "cuda":
+            torch.cuda.synchronize()
+
     def _segment_and_track_chunk(
         self,
         *,
@@ -132,6 +142,8 @@ class ServerGSAM:
         if start_frame_idx < 0 or start_frame_idx >= len(pil_images):
             return {"ok": False, "reason": "bad_start_frame_idx"}, [], None
 
+        # init = load the detect frame + spin up a fresh SAM2 inference state.
+        t_init0 = time.perf_counter()
         det_image = pil_images[start_frame_idx]
         det_frame_tensor, video_height, video_width = load_video_frames_from_pil_images(
             [det_image],
@@ -146,7 +158,12 @@ class ServerGSAM:
             video_width=video_width,
             offload_video_to_cpu=True,
         )
+        self._cuda_sync()
+        init_ms = (time.perf_counter() - t_init0) * 1e3
 
+        # detect = GroundingDINO open-vocab box detection (the heavy part of a
+        # "segment" call; this is why detect frames cost far more than tracking).
+        t_det0 = time.perf_counter()
         det_inputs = self.processor(
             images=det_image, text=target_text, return_tensors="pt"
         ).to(self.device)
@@ -160,11 +177,18 @@ class ServerGSAM:
             text_threshold=text_threshold,
             target_sizes=[det_image.size[::-1]],
         )
+        self._cuda_sync()
+        detect_ms = (time.perf_counter() - t_det0) * 1e3
 
         boxes = det_results[0]["boxes"]
         labels = det_results[0]["labels"]
         det_scores = self._to_float_list(det_results[0].get("scores"))
         if boxes.shape[0] == 0:
+            print(
+                f"[server segment] text='{target_text}' boxes=0 | "
+                f"init={init_ms:.0f}ms detect(GDINO)={detect_ms:.0f}ms (no boxes)",
+                flush=True,
+            )
             return {
                 "ok": False,
                 "reason": "no_boxes",
@@ -172,6 +196,8 @@ class ServerGSAM:
                 "num_instances": 0,
             }, [], None
 
+        # sam = SAM2 mask prediction for the detected boxes + seeding the state.
+        t_sam0 = time.perf_counter()
         self.image_predictor.set_image(np.array(det_image.convert("RGB")))
         masks, _, mask_scores = self.image_predictor.predict(
             point_coords=None,
@@ -208,6 +234,14 @@ class ServerGSAM:
                 "grounding_score": grounding_score,
                 "sam_score": sam_score,
             }
+        self._cuda_sync()
+        sam_ms = (time.perf_counter() - t_sam0) * 1e3
+        print(
+            f"[server segment] text='{target_text}' boxes={int(boxes.shape[0])} "
+            f"instances={len(object_labels)} | init={init_ms:.0f}ms "
+            f"detect(GDINO)={detect_ms:.0f}ms sam={sam_ms:.0f}ms",
+            flush=True,
+        )
 
         frame_parts: list[dict[str, Any]] = []
         raw_parts: list[bytes] = []
@@ -251,6 +285,12 @@ class ServerGSAM:
             "mask_dtype": "uint16",
             "mask_shape": [int(video_height), int(video_width)],
             "frame_parts": frame_parts,
+            "server_segment_detail": {
+                "num_boxes": int(boxes.shape[0]),
+                "init_ms": round(init_ms, 2),
+                "detect_ms": round(detect_ms, 2),
+                "sam_ms": round(sam_ms, 2),
+            },
         }
         return meta, raw_parts, inference_state
 
@@ -260,30 +300,45 @@ class ServerGSAM:
         *,
         inference_state: Any,
         pil_images: list[Image.Image],
+        state_key: str = "",
     ) -> tuple[dict[str, Any], list[bytes], Any | None]:
         if len(pil_images) == 0:
             return {"ok": False, "reason": "no_images"}, [], None
 
+        # load = decode/resize the new frame(s) onto the device.
+        t_load0 = time.perf_counter()
         frames_tensor, video_height, video_width = load_video_frames_from_pil_images(
             pil_images,
             image_size=self.video_predictor.image_size,
             offload_video_to_cpu=True,
             compute_device=self.device,
         )
+        self._cuda_sync()
+        load_ms = (time.perf_counter() - t_load0) * 1e3
 
+        # mem_frames = how many frames are already in this state's SAM2 memory
+        # bank BEFORE this call. Propagation attends over this history, so if
+        # propagate_ms climbs as mem_frames grows (and resets when the episode
+        # resets), the slowdown is memory-bank growth, not instance count.
         prev_num_frames = int(inference_state["num_frames"])
+        t_app0 = time.perf_counter()
         self.video_predictor.state_append_images(
             inference_state,
             frames_tensor,
             video_height=video_height,
             video_width=video_width,
         )
+        self._cuda_sync()
+        append_ms = (time.perf_counter() - t_app0) * 1e3
 
         frame_parts: list[dict[str, Any]] = []
         raw_parts: list[bytes] = []
         object_confidences: dict[int, dict[str, Any]] = {}
         num_new_frames = int(frames_tensor.shape[0])
-        
+
+        # propagate = the actual SAM2 tracking forward pass (one per object,
+        # attending over mem_frames of history). The .cpu() inside the loop syncs.
+        t_prop0 = time.perf_counter()
         iterator = self.video_predictor.propagate_in_video(
             inference_state,
             start_frame_idx=prev_num_frames,
@@ -312,6 +367,17 @@ class ServerGSAM:
             raw_parts.append(mask_img.cpu().numpy().astype(np.uint16).tobytes())
             frame_parts.append({"frame_idx": int(out_frame_idx), "mask_part_index": part_index})
 
+        self._cuda_sync()
+        propagate_ms = (time.perf_counter() - t_prop0) * 1e3
+        num_objects = len(inference_state.get("obj_ids", []))
+        print(
+            f"[server track] state={state_key or '?'} mem_frames={prev_num_frames} "
+            f"objects={num_objects} new_frames={num_new_frames} | "
+            f"load={load_ms:.0f}ms append={append_ms:.0f}ms "
+            f"propagate={propagate_ms:.0f}ms tracked={tracked_any}",
+            flush=True,
+        )
+
         if not tracked_any:
             return {"ok": False, "reason": "tracking_failed"}, [], None
 
@@ -319,12 +385,20 @@ class ServerGSAM:
             "ok": True,
             "reason": "ok",
             "num_frames": len(frame_parts),
-            "num_instances": len(inference_state.get("obj_ids", [])),
+            "num_instances": num_objects,
             "instance_labels": {},
             "instance_confidences": object_confidences,
             "mask_dtype": "uint16",
             "mask_shape": [int(video_height), int(video_width)],
             "frame_parts": frame_parts,
+            "server_track_detail": {
+                "mem_frames": prev_num_frames,
+                "num_objects": num_objects,
+                "new_frames": num_new_frames,
+                "load_ms": round(load_ms, 2),
+                "append_ms": round(append_ms, 2),
+                "propagate_ms": round(propagate_ms, 2),
+            },
         }
         return meta, raw_parts, inference_state
 
@@ -373,6 +447,12 @@ class ServerGSAM:
             meta["server_total_ms"] = round(
                 (time.perf_counter() - t_handler_start) * 1e3, 2
             )
+            print(
+                f"[server handler] cmd={mode} state={meta.get('state_key', '?')} "
+                f"ok={meta.get('ok')} | img_decode={img_decode_ms:.0f}ms "
+                f"compute={compute_ms:.0f}ms total={meta['server_total_ms']:.0f}ms",
+                flush=True,
+            )
             self._reply(meta, raw_parts)
 
         if mode == "segment":
@@ -406,6 +486,7 @@ class ServerGSAM:
             meta, raw_parts, updated_state = self._track_chunk_from_state(
                 inference_state=existing_state,
                 pil_images=pil_images,
+                state_key=state_key,
             )
             compute_ms = (time.perf_counter() - t_c0) * 1e3
             if meta.get("ok") and updated_state is not None:
@@ -488,7 +569,7 @@ class ServerGSAM:
                 continue
             t_c0 = time.perf_counter()
             meta_i, raw_i, updated = self._track_chunk_from_state(
-                inference_state=existing, pil_images=pil_images
+                inference_state=existing, pil_images=pil_images, state_key=sk
             )
             compute_ms += (time.perf_counter() - t_c0) * 1e3
             if not meta_i.get("ok") or updated is None or not raw_i:
@@ -523,6 +604,13 @@ class ServerGSAM:
         meta["server_compute_ms"] = round(compute_ms, 2)
         meta["server_total_ms"] = round(
             (time.perf_counter() - t_handler_start) * 1e3, 2
+        )
+        ok_states = sum(1 for r in results if r.get("ok"))
+        print(
+            f"[server handler] cmd=track_multi states={len(state_keys)} "
+            f"ok_states={ok_states} | img_decode={img_decode_ms:.0f}ms "
+            f"compute={compute_ms:.0f}ms total={meta['server_total_ms']:.0f}ms",
+            flush=True,
         )
         self._reply(meta, raw_parts)
 
