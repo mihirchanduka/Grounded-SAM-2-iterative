@@ -65,9 +65,10 @@ class ServerGSAM:
         # Bound the per-state streaming memory: keep only the most recent N frames
         # of raw pixels + encoded memory so a long episode doesn't make
         # state_append_images O(n) per call (O(n^2) total) and leak GPU/CPU memory.
-        # 32 is well past SAM2's attention reach (num_maskmem ~10, obj-ptrs 16),
-        # so tracking quality is unchanged. Set 0 to disable (unbounded/legacy).
-        self.video_predictor.streaming_keep_recent = 32
+        # SAM2's attention reach is the floor: object pointers go back
+        # max_obj_ptrs_in_encoder=16 frames, mask-memory ~10 (stride=2). 16 is the
+        # exact minimum; 20 leaves a small margin. Set 0 to disable (legacy).
+        self.video_predictor.streaming_keep_recent = 20
         sam2_image_model = build_sam2(model_cfg, sam2_checkpoint, device=self.device)
         self.image_predictor = SAM2ImagePredictor(sam2_image_model)
 
