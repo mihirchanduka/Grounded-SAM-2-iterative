@@ -74,34 +74,43 @@ class ServerGSAM:
         self.image_predictor = SAM2ImagePredictor(sam2_image_model)
 
         # torch.compile the heavy Hiera image backbone. Every track call re-encodes a
-        # fixed image_size x image_size, batch-1 frame, so the shapes are static
-        # (dynamic=False) — compile warms up once (first forward is slow) then runs
-        # fused kernels with no accuracy change. Mirrors SAM2's built-in
-        # compile_image_encoder path; we apply it post-build so it composes with the
-        # track_multi shared-encode. Guarded per model so an unsupported build (e.g.
-        # some ROCm setups) just falls back to eager. Skipped on CPU/ROCm.
+        # fixed image_size x image_size, batch-1 frame, so shapes are static
+        # (dynamic=False) and compile warms up once then runs fused kernels with no
+        # accuracy change. We use the DEFAULT inductor mode, NOT max-autotune: on some
+        # GPUs max-autotune's Triton matmul templates demand more shared memory than
+        # the hardware has (e.g. ~130KB vs ~100KB -> "out of resource: shared memory")
+        # and crash the first forward. Default mode keeps cuBLAS/cuDNN for the heavy
+        # matmul/conv and only fuses pointwise/norm ops, avoiding the smem blowup while
+        # still speeding things up. We compile THEN warm up at startup, so a failure
+        # surfaces here (controlled) and reverts to eager instead of killing a live
+        # request mid-episode. Skipped on CPU/ROCm.
         self._compiled_backbone = False
         if compile_backbone and self.device == "cuda" and not self.is_rocm:
             for label, model in (
                 ("video", self.video_predictor),
                 ("image", self.image_predictor.model),
             ):
+                eager_forward = model.image_encoder.forward
                 try:
                     model.image_encoder.forward = torch.compile(
                         model.image_encoder.forward,
-                        mode="max-autotune",
                         fullgraph=True,
                         dynamic=False,
                     )
-                    self._compiled_backbone = True
-                    print(
-                        f"Compiled {label} SAM2 image encoder "
-                        "(torch.compile; first forward will be slow)."
+                    # Force compilation now and confirm it actually runs on this GPU.
+                    warm = torch.zeros(
+                        1, 3, model.image_size, model.image_size, device=self.device
                     )
+                    with torch.inference_mode():
+                        model.forward_image(warm)
+                    self._cuda_sync()
+                    self._compiled_backbone = True
+                    print(f"Compiled + warmed {label} SAM2 image encoder.")
                 except Exception as exc:  # pragma: no cover
+                    model.image_encoder.forward = eager_forward
                     print(
                         f"torch.compile({label} image encoder) failed, "
-                        f"using eager: {exc}"
+                        f"reverted to eager: {exc}"
                     )
 
         model_id = "IDEA-Research/grounding-dino-base"
