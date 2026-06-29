@@ -39,6 +39,7 @@ class ServerGSAM:
         endpoint: str = "tcp://0.0.0.0:8091",
         sam2_checkpoint: str = "./checkpoints/sam2.1_hiera_small.pt",
         model_cfg: str = "configs/sam2.1/sam2.1_hiera_s.yaml",
+        compile_backbone: bool = True,
     ) -> None:
         self.endpoint = endpoint
         self.context = zmq.Context()
@@ -71,6 +72,37 @@ class ServerGSAM:
         self.video_predictor.streaming_keep_recent = 20
         sam2_image_model = build_sam2(model_cfg, sam2_checkpoint, device=self.device)
         self.image_predictor = SAM2ImagePredictor(sam2_image_model)
+
+        # torch.compile the heavy Hiera image backbone. Every track call re-encodes a
+        # fixed image_size x image_size, batch-1 frame, so the shapes are static
+        # (dynamic=False) — compile warms up once (first forward is slow) then runs
+        # fused kernels with no accuracy change. Mirrors SAM2's built-in
+        # compile_image_encoder path; we apply it post-build so it composes with the
+        # track_multi shared-encode. Guarded per model so an unsupported build (e.g.
+        # some ROCm setups) just falls back to eager. Skipped on CPU/ROCm.
+        self._compiled_backbone = False
+        if compile_backbone and self.device == "cuda" and not self.is_rocm:
+            for label, model in (
+                ("video", self.video_predictor),
+                ("image", self.image_predictor.model),
+            ):
+                try:
+                    model.image_encoder.forward = torch.compile(
+                        model.image_encoder.forward,
+                        mode="max-autotune",
+                        fullgraph=True,
+                        dynamic=False,
+                    )
+                    self._compiled_backbone = True
+                    print(
+                        f"Compiled {label} SAM2 image encoder "
+                        "(torch.compile; first forward will be slow)."
+                    )
+                except Exception as exc:  # pragma: no cover
+                    print(
+                        f"torch.compile({label} image encoder) failed, "
+                        f"using eager: {exc}"
+                    )
 
         model_id = "IDEA-Research/grounding-dino-base"
         self.processor = AutoProcessor.from_pretrained(model_id)
@@ -308,18 +340,27 @@ class ServerGSAM:
         inference_state: Any,
         pil_images: list[Image.Image],
         state_key: str = "",
+        frames_tensor: Any | None = None,
+        video_height: int | None = None,
+        video_width: int | None = None,
+        shared_feature: tuple[Any, Any] | None = None,
     ) -> tuple[dict[str, Any], list[bytes], Any | None]:
         if len(pil_images) == 0:
             return {"ok": False, "reason": "no_images"}, [], None
 
-        # load = decode/resize the new frame(s) onto the device.
+        # load = decode/resize the new frame(s) onto the device. track_multi
+        # precomputes this ONCE and shares it across states (the frame is identical
+        # for every state), so we skip the per-state reload when it's provided.
         t_load0 = time.perf_counter()
-        frames_tensor, video_height, video_width = load_video_frames_from_pil_images(
-            pil_images,
-            image_size=self.video_predictor.image_size,
-            offload_video_to_cpu=True,
-            compute_device=self.device,
-        )
+        if frames_tensor is None:
+            frames_tensor, video_height, video_width = (
+                load_video_frames_from_pil_images(
+                    pil_images,
+                    image_size=self.video_predictor.image_size,
+                    offload_video_to_cpu=True,
+                    compute_device=self.device,
+                )
+            )
         self._cuda_sync()
         load_ms = (time.perf_counter() - t_load0) * 1e3
 
@@ -342,6 +383,15 @@ class ServerGSAM:
         raw_parts: list[bytes] = []
         object_confidences: dict[int, dict[str, Any]] = {}
         num_new_frames = int(frames_tensor.shape[0])
+
+        # Reuse the Hiera backbone features computed once for this frame (track_multi
+        # shares them across states). The new frame's absolute index is
+        # prev_num_frames; seed this state's single-entry feature cache under that key
+        # so propagate_in_video's _get_image_feature hits it instead of re-running the
+        # encoder. The encoder is object-count-independent and dominates a small-N
+        # track call, so this halves it when target + instance states are tracked.
+        if shared_feature is not None and num_new_frames == 1:
+            inference_state["cached_features"] = {prev_num_frames: shared_feature}
 
         # propagate = the actual SAM2 tracking forward pass (one per object,
         # attending over mem_frames of history). The .cpu() inside the loop syncs.
@@ -591,6 +641,37 @@ class ServerGSAM:
             return
         img_decode_ms = (time.perf_counter() - t_decode0) * 1e3
 
+        # Load + encode the shared frame ONCE for all states. The image is identical
+        # across the target/instance states, and the Hiera backbone is the dominant,
+        # object-count-independent cost of a small-N track call — running it per state
+        # doubled it. Each state still runs its own per-object memory attention +
+        # mask decode; only the encoder is shared. Falls back to per-state load/encode
+        # if anything here fails.
+        frames_tensor = video_height = video_width = shared_feature = None
+        t_enc0 = time.perf_counter()
+        try:
+            frames_tensor, video_height, video_width = (
+                load_video_frames_from_pil_images(
+                    pil_images,
+                    image_size=self.video_predictor.image_size,
+                    offload_video_to_cpu=True,
+                    compute_device=self.device,
+                )
+            )
+            if int(frames_tensor.shape[0]) == 1:
+                new_image = frames_tensor[0].to(self.device).float().unsqueeze(0)
+                with torch.inference_mode():
+                    backbone_out = self.video_predictor.forward_image(new_image)
+                shared_feature = (new_image, backbone_out)
+            self._cuda_sync()
+        except Exception as exc:  # pragma: no cover
+            print(
+                f"[track_multi] shared frame encode failed, per-state fallback: {exc}",
+                flush=True,
+            )
+            frames_tensor = video_height = video_width = shared_feature = None
+        shared_encode_ms = (time.perf_counter() - t_enc0) * 1e3
+
         results: list[dict[str, Any]] = []
         raw_parts: list[bytes] = []
         mask_shape = None
@@ -606,7 +687,9 @@ class ServerGSAM:
                 continue
             t_c0 = time.perf_counter()
             meta_i, raw_i, updated = self._track_chunk_from_state(
-                inference_state=existing, pil_images=pil_images, state_key=sk
+                inference_state=existing, pil_images=pil_images, state_key=sk,
+                frames_tensor=frames_tensor, video_height=video_height,
+                video_width=video_width, shared_feature=shared_feature,
             )
             compute_ms += (time.perf_counter() - t_c0) * 1e3
             if not meta_i.get("ok") or updated is None or not raw_i:
@@ -638,6 +721,7 @@ class ServerGSAM:
             raw_parts = self._compress_mask_parts(meta, raw_parts)
         meta["mode_timed"] = "track_multi"
         meta["server_img_decode_ms"] = round(img_decode_ms, 2)
+        meta["server_shared_encode_ms"] = round(shared_encode_ms, 2)
         meta["server_compute_ms"] = round(compute_ms, 2)
         meta["server_total_ms"] = round(
             (time.perf_counter() - t_handler_start) * 1e3, 2
@@ -646,6 +730,7 @@ class ServerGSAM:
         print(
             f"[server handler] cmd=track_multi states={len(state_keys)} "
             f"ok_states={ok_states} | img_decode={img_decode_ms:.0f}ms "
+            f"shared_encode={shared_encode_ms:.0f}ms "
             f"compute={compute_ms:.0f}ms total={meta['server_total_ms']:.0f}ms",
             flush=True,
         )
@@ -886,8 +971,23 @@ if __name__ == "__main__":
         default="tcp://0.0.0.0:8091",
         help="ZMQ REP endpoint to bind (default: tcp://0.0.0.0:8091)",
     )
+    parser.add_argument(
+        "--no-compile",
+        dest="compile_backbone",
+        action="store_false",
+        help=(
+            "Disable torch.compile of the SAM2 image encoder. On by default (CUDA, "
+            "non-ROCm); compile makes the first forward slow but speeds up every "
+            "track afterward. Use this if compile is unstable on your setup."
+        ),
+    )
     args = parser.parse_args()
 
     checkpoint, cfg = SAM2_MODELS[args.model]
-    server = ServerGSAM(endpoint=args.endpoint, sam2_checkpoint=checkpoint, model_cfg=cfg)
+    server = ServerGSAM(
+        endpoint=args.endpoint,
+        sam2_checkpoint=checkpoint,
+        model_cfg=cfg,
+        compile_backbone=args.compile_backbone,
+    )
     server.run()
