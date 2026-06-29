@@ -355,19 +355,41 @@ class ServerGSAM:
         tracked_any = False
         for out_frame_idx, out_obj_ids, out_mask_logits in iterator:
             tracked_any = True
-            mask_img = torch.zeros(video_height, video_width, dtype=torch.int32)
+            # out_mask_logits is [N, 1, H, W] on the compute device. Do every
+            # per-object reduction in batched tensor ops and cross the GPU->CPU
+            # boundary ONCE. The old code called .any()/.item() per object, and each
+            # of those forces a torch.cuda.synchronize() — so an N-object frame paid
+            # ~2N hard syncs that serialized the GPU. That per-object sync tax is the
+            # bulk of the Python overhead this loop adds on top of the SAM2 forward,
+            # and it scales with object count (the thing we're trying to make cheap).
+            logits = out_mask_logits[:, 0]                       # [N, H, W]
+            masks = logits > 0.0                                 # [N, H, W] bool
+            probs = torch.sigmoid(logits)                        # [N, H, W]
+            areas = masks.flatten(1).sum(dim=1)                  # [N]
+            fg_sums = (probs * masks).flatten(1).sum(dim=1)      # [N]
+            # Per-object mean foreground prob over its own mask; for an empty mask
+            # fall back to the whole-image mean (matches the old per-object branch).
+            confs = torch.where(
+                areas > 0,
+                fg_sums / areas.clamp(min=1),
+                probs.flatten(1).mean(dim=1),
+            )
+            confs_cpu = confs.cpu().tolist()                     # the single sync
+
+            # Build the label image on the SAME device as the masks (the old code
+            # allocated it on CPU and indexed it with GPU masks, which only worked
+            # when inference ran on CPU); copy to host once at the end.
+            mask_img = torch.zeros(
+                video_height, video_width, dtype=torch.int32, device=logits.device
+            )
             for i, out_obj_id in enumerate(out_obj_ids):
-                out_mask = out_mask_logits[i] > 0.0
-                mask_img[out_mask[0]] = int(out_obj_id)
-                foreground_prob = torch.sigmoid(out_mask_logits[i])
-                if out_mask[0].any():
-                    confidence = float(foreground_prob[0][out_mask[0]].mean().item())
-                else:
-                    confidence = float(foreground_prob.mean().item())
+                # Last-writer-wins on overlap, same as the original loop order.
+                mask_img[masks[i]] = int(out_obj_id)
+                conf = float(confs_cpu[i])
                 object_confidences[int(out_obj_id)] = {
-                    "confidence": confidence,
+                    "confidence": conf,
                     "grounding_score": None,
-                    "sam_score": confidence,
+                    "sam_score": conf,
                 }
 
             part_index = len(raw_parts)
@@ -709,6 +731,72 @@ class ServerGSAM:
             }
         )
 
+    def _handle_prune_objects(self, message_parts: list[bytes]) -> None:
+        """Remove specific object ids from a tracked state so future propagation
+        stops spending time on them. The perception node calls this once its 3D
+        filters decide a tracked instance is really the floor/wall/shelf or a coarse
+        mask that merged two objects. Propagation cost is ~linear in object count, so
+        dropping the junk keeps tracking proportional to the REAL object count."""
+        if len(message_parts) < 2:
+            self._reply({"ok": False, "reason": "missing_spec"})
+            return
+
+        spec, parse_err = self._json_or_error(message_parts[1])
+        if parse_err:
+            self._reply({"ok": False, "reason": parse_err})
+            return
+
+        state_key = str(spec.get("state_key", "")).strip() if spec else ""
+        if not state_key:
+            self._reply({"ok": False, "reason": "missing_state_key"})
+            return
+
+        state = self.inference_state_dict.get(state_key)
+        if state is None:
+            self._reply(
+                {"ok": False, "reason": "state_not_found", "state_key": state_key}
+            )
+            return
+
+        try:
+            obj_ids = [int(o) for o in (spec.get("obj_ids") or [])]
+        except (TypeError, ValueError):
+            self._reply({"ok": False, "reason": "bad_obj_ids", "state_key": state_key})
+            return
+        if not obj_ids:
+            self._reply({"ok": False, "reason": "no_obj_ids", "state_key": state_key})
+            return
+
+        removed: list[int] = []
+        remaining: list[int] = list(state.get("obj_ids", []))
+        for obj_id in obj_ids:
+            try:
+                # need_output=False: we don't need recomputed masks back, just the
+                # object gone from the state so the next propagate skips it.
+                remaining, _ = self.video_predictor.remove_object(
+                    state, obj_id, strict=False, need_output=False
+                )
+                removed.append(obj_id)
+            except Exception as exc:  # pragma: no cover
+                print(
+                    f"[server prune] remove_object({obj_id}) failed: {exc}", flush=True
+                )
+        print(
+            f"[server prune] state={state_key} requested={obj_ids} "
+            f"removed={removed} remaining={list(remaining)}",
+            flush=True,
+        )
+        self._reply(
+            {
+                "ok": True,
+                "reason": "ok",
+                "state_key": state_key,
+                "removed": removed,
+                "remaining_obj_ids": [int(o) for o in remaining],
+                "num_objects": len(remaining),
+            }
+        )
+
     def _handle_remove_all_states(self, message_parts: list[bytes]) -> None:
         # This command accepts no required payload and clears all cached states.
         _ = message_parts
@@ -742,7 +830,8 @@ class ServerGSAM:
     def run(self) -> None:
         print(
             f"GSAM server ready on {self.endpoint} (REP), "
-            "commands=segment_instances,copy_state,remove_state,remove_all_states,list_states"
+            "commands=segment_instances,track_multi,copy_state,remove_state,"
+            "prune_objects,remove_all_states,list_states"
         )
         while True:
             message_parts = self.socket.recv_multipart(flags=0)
@@ -765,6 +854,10 @@ class ServerGSAM:
 
             if cmd == b"remove_state":
                 self._handle_remove_state(message_parts)
+                continue
+
+            if cmd == b"prune_objects":
+                self._handle_prune_objects(message_parts)
                 continue
 
             if cmd == b"remove_all_states":
